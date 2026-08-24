@@ -8,4 +8,3 @@ so the model keeps the SYSTEM instructions from its Modelfile.
 Galla uses Ollama
 **Markdown is supported in the chat**
 **Galla can make images using SVG**
-***Note: Gems do not use Galla, they use Google DeepMind***
