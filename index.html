@@ -408,6 +408,7 @@
         // the request (and the latency) without bound.
         const MAX_CONTEXT_MESSAGES = 60;
         const STREAM_PAINT_MS = 60;
+        const STREAM_PAINT_MAX_MS = 500;
         const TAGS_TIMEOUT_MS = 5000;
 
         // --- Cached DOM references (previously re-queried on every keystroke/message) ---
@@ -417,7 +418,7 @@
             currentChatId: null,
             activeGemId: null,
             activeGemPrompt: "",
-            sending: false,
+            busy: false,
             controller: null
         };
         const verifiedModels = new Set();
@@ -894,10 +895,28 @@
         }
 
         // ---------------------------------------------------------------- Messaging
-        function buildApiMessages(chat) {
+        // A Gem's instructions ride along as an ordinary user turn -- never as a
+        // `system` message. Ollama replaces the Modelfile's SYSTEM block whenever a
+        // request carries one, which would throw away Galla's own instructions and
+        // leave the Gem talking to a bare base model.
+        const GEM_PREAMBLE = "Additional instructions for this conversation, " +
+            "to follow alongside your existing ones:\n\n";
+        const GEM_ACK = "Understood. I'll follow those instructions from here on.";
+
+        async function resolveGemPrompt() {
+            if (!state.activeGemId) return "";
+            if (state.activeGemPrompt) return state.activeGemPrompt;
+            // The cache isn't populated yet if the Gem was picked a moment ago.
+            const gem = await idbGet("gems", state.activeGemId).catch(() => null);
+            state.activeGemPrompt = (gem && gem.systemPrompt) || "";
+            return state.activeGemPrompt;
+        }
+
+        function buildApiMessages(chat, gemPrompt) {
             const messages = [];
-            if (state.activeGemId && state.activeGemPrompt) {
-                messages.push({ role: "system", content: state.activeGemPrompt });
+            if (gemPrompt) {
+                messages.push({ role: "user", content: GEM_PREAMBLE + gemPrompt });
+                messages.push({ role: "assistant", content: GEM_ACK });
             }
             const history = chat.messages.slice(-MAX_CONTEXT_MESSAGES);
             for (const m of history) {
@@ -957,9 +976,9 @@
         }
 
         function setSending(sending) {
-            state.sending = sending;
             els.sendBtn.textContent = sending ? "Stop" : "Send";
             els.sendBtn.classList.toggle("stop", sending);
+            els.sendBtn.setAttribute("aria-label", sending ? "Stop generating" : "Send message");
         }
 
         async function persistAiReply(chatId, text) {
@@ -974,95 +993,117 @@
         }
 
         async function sendMessage() {
-            if (state.sending) { // The button doubles as "Stop" while generating.
-                if (state.controller) state.controller.abort();
-                return;
-            }
+            // The button doubles as "Stop" once a response is in flight.
+            if (state.controller) { state.controller.abort(); return; }
+            // Set synchronously: `sending` used to be set only after several awaits,
+            // so two quick clicks fired two requests for the same message.
+            if (state.busy) return;
 
             const text = els.input.value.trim();
             if (!text) return;
 
-            try { await dbReady; } catch (err) {
-                alert("Storage is unavailable, so chats can't be saved: " + err.message);
-                return;
-            }
-
+            state.busy = true;
+            setSending(true);
             els.input.value = "";
-            const welcome = document.getElementById("welcome-message");
-            if (welcome) welcome.remove();
-
-            // startNewChat is asynchronous -- the old code fired it and immediately
-            // read back a chat that didn't exist yet, dropping the first message.
-            if (!state.currentChatId) await startNewChat({ silent: true });
-
-            let chat = await idbGet("chats", state.currentChatId);
-            if (!chat) chat = { id: state.currentChatId, title: "New Chat", messages: [], timestamp: Date.now() };
-            if (!Array.isArray(chat.messages)) chat.messages = [];
-
-            const isFirstMessage = chat.messages.length === 0;
-            if (isFirstMessage) chat.title = makeTitle(text);
-            chat.messages.push({ sender: "user", text });
-            chat.timestamp = Date.now();
-            await idbPut("chats", chat);
-
-            renderMessage("user", text);
-            // Only rebuild the list when the title actually changed.
-            if (isFirstMessage) await loadChatList();
 
             const model = els.model.value;
-            const bubble = appendBubble("ai");
-            bubble.textContent = "Thinking…";
-
-            setSending(true);
-            const controller = new AbortController();
-            state.controller = controller;
-
+            let chatId = null;
+            let bubble = null;
             let full = "";
+
             try {
+                try { await dbReady; } catch (err) {
+                    alert("Storage is unavailable, so chats can't be saved: " + err.message);
+                    return;
+                }
+
+                const welcome = document.getElementById("welcome-message");
+                if (welcome) welcome.remove();
+
+                // startNewChat is asynchronous -- the old code fired it and immediately
+                // read back a chat that didn't exist yet, dropping the first message.
+                if (!state.currentChatId) await startNewChat({ silent: true });
+                // Pin the target: the user can open a different chat mid-stream, and
+                // the reply must land in the conversation it was asked in.
+                chatId = state.currentChatId;
+
+                let chat = await idbGet("chats", chatId);
+                if (!chat) chat = { id: chatId, title: "New Chat", messages: [], timestamp: Date.now() };
+                if (!Array.isArray(chat.messages)) chat.messages = [];
+
+                const isFirstMessage = chat.messages.length === 0;
+                if (isFirstMessage) chat.title = makeTitle(text);
+                chat.messages.push({ sender: "user", text });
+                chat.timestamp = Date.now();
+                await idbPut("chats", chat);
+
+                renderMessage("user", text);
+                // Only rebuild the list when the title actually changed.
+                if (isFirstMessage) await loadChatList();
+
+                const gemPrompt = await resolveGemPrompt();
+                bubble = appendBubble("ai");
+                bubble.textContent = "Thinking…";
+                // Once the user navigates away this bubble is detached; skip the paints.
+                const onScreen = () => state.currentChatId === chatId && bubble.isConnected;
+
+                const controller = new AbortController();
+                state.controller = controller;
+
                 if (!(await ensureModelReady(model))) { bubble.remove(); return; }
 
                 let lastPaint = 0;
                 await streamChat({
                     model,
-                    messages: buildApiMessages(chat),
+                    messages: buildApiMessages(chat, gemPrompt),
                     signal: controller.signal,
                     onDelta: (acc) => {
                         full = acc;
+                        if (!onScreen()) return;
+                        // Re-parsing Markdown costs more as the reply grows, so back
+                        // the repaint rate off instead of doing it 16x a second.
+                        const wait = Math.min(STREAM_PAINT_MAX_MS, STREAM_PAINT_MS + full.length / 40);
                         const now = Date.now();
-                        if (now - lastPaint < STREAM_PAINT_MS) return;
+                        if (now - lastPaint < wait) return;
                         lastPaint = now;
                         const stick = isNearBottom();
                         // SVG wrapping is skipped mid-stream: the markup is still partial.
                         fillBubble(bubble, "ai", full, { withSvg: false });
                         bubble.appendChild(Object.assign(document.createElement("span"), {
-                            className: "typing-cursor", textContent: "▍"
+                            className: "typing-cursor", textContent: "\u258D"
                         }));
                         if (stick) scrollToBottom();
                     }
                 });
 
-                fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
-                scrollToBottom();
-                if (full.trim()) await persistAiReply(state.currentChatId, full);
+                if (onScreen()) {
+                    fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
+                    scrollToBottom();
+                }
+                if (full.trim()) await persistAiReply(chatId, full);
             } catch (err) {
                 if (err.name === "AbortError") {
                     if (full.trim()) {
-                        fillBubble(bubble, "ai", full);
-                        await persistAiReply(state.currentChatId, full);
-                    } else {
+                        if (bubble && bubble.isConnected) fillBubble(bubble, "ai", full);
+                        if (chatId) await persistAiReply(chatId, full);
+                    } else if (bubble) {
                         bubble.remove();
                     }
-                } else {
+                } else if (bubble) {
                     bubble.classList.add("error-message");
                     bubble.textContent = "Error: " + err.message +
-                        " — make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
+                        " \u2014 make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
                     // Re-check the connection before the next send.
                     verifiedModels.delete(model);
+                } else {
+                    alert("Something went wrong: " + err.message);
                 }
             } finally {
                 state.controller = null;
+                state.busy = false;
                 setSending(false);
-                els.input.focus();
+                // Refocusing on a phone pops the keyboard back up over the answer.
+                if (window.innerWidth > 768) els.input.focus();
             }
         }
 
