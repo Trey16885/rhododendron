@@ -6,3 +6,4 @@ You can make it have a custom personality or ask about preset personalities.
 Galla uses Ollama
 **Markdown is supported in the chat**
 **Galla can make images using SVG**
+***Note: Gems do not use Galla, they use Google DeepMind***
