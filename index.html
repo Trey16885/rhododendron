@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rhododendron 2.0</title>
+    <!-- Marked.js for Markdown parsing -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --chat-bg: #1e293b;
+            --text-main: #f8fafc;
+            --accent: #3b82f6;
+            --user-msg: #2563eb;
+            --ai-msg: #334155;
+            --error: #ef4444;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        header {
+            background-color: var(--chat-bg);
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+        }
+
+        header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            color: var(--text-main);
+        }
+
+        select {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid #475569;
+            padding: 0.5rem;
+            border-radius: 0.5rem;
+            outline: none;
+        }
+
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .message {
+            max-width: 80%;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            line-height: 1.5;
+        }
+
+        .user-message {
+            background-color: var(--user-msg);
+            align-self: flex-end;
+            border-bottom-right-radius: 0;
+        }
+
+        .ai-message {
+            background-color: var(--ai-msg);
+            align-self: flex-start;
+            border-bottom-left-radius: 0;
+        }
+
+        .ai-message pre {
+            background-color: #0f172a;
+            padding: 1rem;
+            border-radius: 0.25rem;
+            overflow-x: auto;
+        }
+
+        .ai-message code {
+            font-family: monospace;
+        }
+
+        /* SVG Rendering Container */
+        .svg-render {
+            margin-top: 10px;
+            padding: 10px;
+            background: #ffffff;
+            border-radius: 8px;
+            display: inline-block;
+        }
+
+        .input-area {
+            display: flex;
+            padding: 1rem;
+            background-color: var(--chat-bg);
+            border-top: 1px solid #334155;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            border: 1px solid #475569;
+            background-color: var(--bg-color);
+            color: white;
+            outline: none;
+        }
+
+        button {
+            background-color: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            margin-left: 0.5rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background-color: #2563eb;
+        }
+
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-content {
+            background-color: var(--chat-bg);
+            padding: 2rem;
+            border-radius: 0.5rem;
+            max-width: 600px;
+            width: 90%;
+        }
+
+        .modal-content h2 { color: var(--error); margin-top: 0; }
+        .modal-content code { background-color: #0f172a; padding: 0.25rem; border-radius: 0.25rem; color: #a5b4fc; }
+        .code-block { background-color: #0f172a; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 1rem 0; font-family: monospace;}
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>Rhododendron 2.0</h1>
+        <select id="model-select">
+            <option value="rhododendron/galla:1">Galla 1</option>
+            <option value="rhododendron/galla:1-pro">Galla 1 Pro</option>
+        </select>
+    </header>
+
+    <div id="chat-container">
+        <div class="message ai-message">Welcome to Rhododendron 2.0! System prompts are loaded from the Modelfile. How can I help you today?</div>
+    </div>
+
+    <div class="input-area">
+        <input type="text" id="user-input" placeholder="Message Rhododendron..." onkeypress="if(event.key === 'Enter') sendMessage()">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <!-- CORS / Connection Error Modal -->
+    <div id="cors-modal" class="modal">
+        <div class="modal-content">
+            <h2>Ollama Connection Failed</h2>
+            <p>Rhododendron runs locally on your machine, but we couldn't connect to Ollama. Make sure it's installed and running with CORS allowed.</p>
+            
+            <h3>Termux (Android):</h3>
+            <div class="code-block">pkg install -y ollama && OLLAMA_ORIGINS="*" ollama serve</div>
+            
+            <h3>Windows:</h3>
+            <div class="code-block">irm https://ollama.com/install.ps1 | iex<br><br># Then run:<br>OLLAMA_ORIGINS="*" ollama serve</div>
+            
+            <h3>MacOS:</h3>
+            <div class="code-block">curl -fsSL https://ollama.com/install.sh | sh<br><br># Then run:<br>OLLAMA_ORIGINS="*" ollama serve</div>
+            
+            <h3>Linux:</h3>
+            <div class="code-block">curl -fsSL https://ollama.com/install.sh | sh && OLLAMA_ORIGINS="*" ollama serve</div>
+            
+            <button onclick="closeModal('cors-modal')">I've Started It - Retry</button>
+        </div>
+    </div>
+
+    <!-- Missing Model Modal -->
+    <div id="model-modal" class="modal">
+        <div class="modal-content">
+            <h2>Model Not Found</h2>
+            <p>You are connected to Ollama, but you don't have the <strong id="missing-model-name"></strong> model downloaded yet.</p>
+            <p>Open your terminal and run:</p>
+            <div class="code-block" id="pull-command"></div>
+            <button onclick="closeModal('model-modal')">I've Pulled It - Retry</button>
+        </div>
+    </div>
+
+    <script>
+        const OLLAMA_URL = "http://localhost:11434";
+
+        async function checkOllamaSetup(modelName) {
+            try {
+                // 1. Check if Ollama is accessible (CORS check)
+                const res = await fetch(`${OLLAMA_URL}/api/tags`);
+                if (!res.ok) throw new Error("Connection failed");
+                
+                // 2. Check if the specific model exists
+                const data = await res.json();
+                const modelExists = data.models.some(m => m.name === modelName || m.name === `${modelName}:latest`);
+                
+                if (!modelExists) {
+                    document.getElementById('missing-model-name').innerText = modelName;
+                    document.getElementById('pull-command').innerText = `ollama pull ${modelName}`;
+                    document.getElementById('model-modal').style.display = 'flex';
+                    return false;
+                }
+                
+                return true;
+            } catch (error) {
+                document.getElementById('cors-modal').style.display = 'flex';
+                return false;
+            }
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+
+        function appendMessage(sender, text) {
+            const chatContainer = document.getElementById("chat-container");
+            const msgDiv = document.createElement("div");
+            msgDiv.className = `message ${sender === 'user' ? 'user-message' : 'ai-message'}`;
+            
+            if (sender === 'ai') {
+                // Parse Markdown
+                let formattedText = marked.parse(text);
+                
+                // Detect and extract raw SVG code to render it dynamically
+                const svgRegex = /<svg[\s\S]*?<\/svg>/gi;
+                const svgs = text.match(svgRegex);
+                
+                if (svgs) {
+                    svgs.forEach(svgCode => {
+                        // Append a visual render block below the code
+                        formattedText += `<br><div class="svg-render">${svgCode}</div>`;
+                    });
+                }
+                
+                msgDiv.innerHTML = formattedText;
+            } else {
+                msgDiv.innerText = text;
+            }
+
+            chatContainer.appendChild(msgDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const inputField = document.getElementById("user-input");
+            const text = inputField.value.trim();
+            if (!text) return;
+
+            const selectedModel = document.getElementById("model-select").value;
+
+            // Clear input immediately
+            inputField.value = "";
+            appendMessage("user", text);
+
+            // Verify setup before sending
+            const isReady = await checkOllamaSetup(selectedModel);
+            if (!isReady) return;
+
+            // Generate response placeholder
+            const chatContainer = document.getElementById("chat-container");
+            const aiMsgDiv = document.createElement("div");
+            aiMsgDiv.className = "message ai-message";
+            aiMsgDiv.innerText = "Thinking...";
+            chatContainer.appendChild(aiMsgDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            try {
+                const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        model: selectedModel,
+                        prompt: text,
+                        stream: false
+                        // Note: System prompt is excluded entirely here so the API relies solely on the Modelfile.
+                    })
+                });
+
+                if (!response.ok) throw new Error("API Error");
+                
+                const data = await response.json();
+                
+                // Remove placeholder and append real formatted message
+                chatContainer.removeChild(aiMsgDiv);
+                appendMessage("ai", data.response);
+
+            } catch (error) {
+                aiMsgDiv.innerText = "Error: Could not communicate with Ollama.";
+                aiMsgDiv.style.color = "var(--error)";
+            }
+        }
+    </script>
+</body>
+</html>
