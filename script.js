@@ -552,6 +552,10 @@
                 const res = await fetch(base + "/api/tags", { signal: controller.signal });
                 if (!res.ok) throw new Error("HTTP " + res.status);
                 const data = await res.json();
+                // Verification is per endpoint: a model confirmed on localhost
+                // says nothing about what the tunnel has, so switching hosts
+                // has to re-check rather than trust the old answer.
+                if (OLLAMA_URL !== base) verifiedModels.clear();
                 OLLAMA_URL = base;
                 writeSetting("endpoint", base);
                 return data;
@@ -716,7 +720,6 @@
 
         state.busy = true;
         setSending(true);
-        els.input.value = "";
 
         const model = els.model.value;
         let chatId = null;
@@ -729,6 +732,13 @@
                 return;
             }
 
+            // Check the connection and the model BEFORE the message is cleared
+            // from the box and written to the chat. Doing it last meant a failed
+            // check threw away what you had typed and left a user turn with no
+            // reply in the history, replayed as context on every later send.
+            if (!(await ensureModelReady(model))) return;
+
+            els.input.value = "";
             const welcome = document.getElementById("welcome-message");
             if (welcome) welcome.remove();
 
@@ -761,8 +771,6 @@
 
             const controller = new AbortController();
             state.controller = controller;
-
-            if (!(await ensureModelReady(model))) { bubble.remove(); return; }
 
             let lastPaint = 0;
             await streamChat({
