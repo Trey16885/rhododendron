@@ -2,19 +2,23 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- viewport-fit=cover so env(safe-area-inset-*) reports real values on
+         notched/gesture-bar phones; interactive-widget makes Chrome resize the
+         layout when the on-screen keyboard opens instead of covering it. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <meta name="color-scheme" content="dark">
     <title>Rhododendron 2.0</title>
     <!-- Inline icon: avoids a 404 round-trip for /favicon.ico on every load -->
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%8C%B8%3C/text%3E%3C/svg%3E">
-    <!-- Marked.js for Markdown parsing -->
+    <link rel="stylesheet" href="style.css">
+    <!-- Marked.js for Markdown parsing (version pinned so a CDN release can't break the API) -->
     <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
     <!-- JSZip for exporting and importing data -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
-    <!-- External CSS -->
-    <link rel="stylesheet" href="style.css">
-    <!-- External JavaScript -->
-    <script src="script.js" defer></script>
+    <!-- A module so `vite build` can bundle it: as a plain classic script it was
+         skipped entirely and dist/ shipped no JavaScript. Modules are deferred,
+         so this still runs after the two libraries above. -->
+    <script type="module" src="./script.js"></script>
 </head>
 <body>
 
@@ -23,6 +27,7 @@
 
     <!-- Sidebar: Chats, Gems, Data -->
     <div id="sidebar">
+        <button id="sidebar-close" aria-label="Close menu">&times;</button>
         <button class="sidebar-btn new-btn" id="new-chat-btn">+ New Chat</button>
 
         <div class="sidebar-section" style="margin-top: 1rem;">
@@ -49,7 +54,8 @@
         <header>
             <div class="header-left">
                 <button id="menu-btn" aria-label="Toggle sidebar" aria-expanded="false">☰</button>
-                <h1 id="header-title">Rhododendron 2.0</h1>
+                <h1 id="header-title">Rhododendron<span class="title-version"> 2.0</span></h1>
+                <span id="gem-badge" title="A Gem is active" hidden>💎</span>
             </div>
             <select id="model-select" aria-label="Model">
                 <option value="rhododendron/galla:sonnet-1">GallaSonnet 1 Pro</option>
@@ -85,6 +91,7 @@
         <div class="modal-content" role="dialog" aria-modal="true" aria-label="Ollama connection failed">
             <h2 class="error">Ollama Connection Failed</h2>
             <p>Rhododendron runs locally on your machine, but we couldn't connect to Ollama. Make sure it's installed and running with CORS allowed.</p>
+            <p style="color: var(--text-muted); font-size: 0.9rem; margin: 0;">Tried: <span id="tried-endpoints"></span></p>
 
             <h3>Termux (Android):</h3>
             <div class="code-block">pkg install -y ollama &amp;&amp; OLLAMA_ORIGINS="*" ollama serve</div>

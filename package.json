@@ -2,6 +2,7 @@
   "name": "rhododendron-ai",
   "version": "2.0.0",
   "description": "A fully local, web-based AI workspace connecting to Ollama with IndexedDB memory and SVG rendering.",
+  "private": true,
   "main": "index.html",
   "scripts": {
     "dev": "vite",
