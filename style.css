@@ -20,19 +20,11 @@ body {
     color: var(--text-main);
     margin: 0;
     display: flex;
-    /* 100vh on mobile Chrome/Safari is the viewport with the URL bar
-       HIDDEN, so the composer at the bottom of the column sat below the
-       visible area -- and overflow:hidden meant you could not scroll to
-       it. dvh tracks the actually-visible height instead. */
+    /* Use dynamic viewport height for mobile browsers, fallback to 100vh */
     height: 100vh;
     height: 100dvh;
     overflow: hidden;
-    overscroll-behavior: none;
 }
-
-/* Set only while the on-screen keyboard is up, from the visual viewport,
-   for browsers that don't honour interactive-widget=resizes-content. */
-body.keyboard-open { height: var(--app-height); }
 
 /* Sidebar Styles */
 #sidebar {
@@ -49,21 +41,6 @@ body.keyboard-open { height: var(--app-height); }
 }
 
 .sidebar-section { margin-bottom: 1.5rem; }
-
-/* The open sidebar covers the hamburger, so on a phone the only way to
-   dismiss it was a sliver of overlay down the right edge. */
-#sidebar-close {
-    display: none;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 1.75rem;
-    line-height: 1;
-    padding: 0 0.25rem;
-    margin: -0.25rem 0 0.5rem auto;
-    cursor: pointer;
-}
-#sidebar-close:hover { color: var(--text-main); }
 
 .sidebar-title {
     font-size: 0.8rem;
@@ -86,7 +63,6 @@ body.keyboard-open { height: var(--app-height); }
     margin-bottom: 0.5rem;
     font-size: 0.95rem;
     font-family: inherit;
-    /* Long chat titles used to blow out the sidebar */
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -123,15 +99,11 @@ body.keyboard-open { height: var(--app-height); }
 header {
     background-color: var(--chat-bg);
     padding: 0.75rem 1rem;
-    padding-top: calc(0.75rem + env(safe-area-inset-top, 0px));
-    padding-left: calc(1rem + env(safe-area-inset-left, 0px));
-    padding-right: calc(1rem + env(safe-area-inset-right, 0px));
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 0.5rem;
     border-bottom: 1px solid var(--border);
-    flex: 0 0 auto;
 }
 
 .header-left {
@@ -139,11 +111,11 @@ header {
     align-items: center;
     gap: 0.75rem;
     min-width: 0;
-    flex: 1;
+    flex: 1; /* Allow left side to take remaining space */
 }
 
 #menu-btn {
-    display: none; /* Hidden on desktop */
+    display: none;
     background: none;
     border: none;
     color: var(--text-main);
@@ -169,8 +141,7 @@ select {
     padding: 0.5rem;
     border-radius: 0.5rem;
     outline: none;
-    /* Percentage rather than a pixel cap: the model names vary in length. */
-    max-width: 45%;
+    max-width: 45%; /* Prevent dropdown from pushing screen wide */
     flex-shrink: 0;
     font-family: inherit;
     font-size: 0.9rem;
@@ -178,16 +149,9 @@ select {
 
 #chat-container {
     flex: 1;
-    /* Without this the transcript refuses to shrink below its content
-       height and shoves the composer off the bottom of the screen. */
-    min-height: 0;
     overflow-y: auto;
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
     overflow-wrap: anywhere;
     padding: 1rem;
-    padding-left: calc(1rem + env(safe-area-inset-left, 0px));
-    padding-right: calc(1rem + env(safe-area-inset-right, 0px));
     display: flex;
     flex-direction: column;
     gap: 1rem;
@@ -202,7 +166,7 @@ select {
 }
 
 .user-message { background-color: var(--user-msg); align-self: flex-end; border-bottom-right-radius: 0; white-space: pre-wrap; }
-.ai-message { background-color: var(--ai-msg); align-self: flex-start; border-bottom-left-radius: 0; width: 100%; }
+.ai-message { background-color: var(--ai-msg); align-self: flex-start; border-bottom-left-radius: 0; width: 100%; box-sizing: border-box; }
 .ai-message > :first-child { margin-top: 0; }
 .ai-message > :last-child { margin-bottom: 0; }
 .ai-message pre { background-color: #0f172a; padding: 1rem; border-radius: 0.25rem; overflow-x: auto; max-width: 100%; }
@@ -222,6 +186,7 @@ select {
     display: inline-block;
     max-width: 100%;
     overflow-x: auto;
+    box-sizing: border-box;
 }
 
 .svg-btn {
@@ -241,14 +206,10 @@ select {
 .input-area {
     display: flex;
     padding: 1rem;
-    /* Clear the home indicator / gesture bar. */
-    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
-    padding-left: calc(1rem + env(safe-area-inset-left, 0px));
-    padding-right: calc(1rem + env(safe-area-inset-right, 0px));
     background-color: var(--chat-bg);
     border-top: 1px solid var(--border);
     gap: 0.5rem;
-    flex: 0 0 auto;
+    box-sizing: border-box;
 }
 
 input[type="text"] {
@@ -273,7 +234,7 @@ button.send-btn {
     cursor: pointer;
     font-weight: bold;
     font-family: inherit;
-    min-width: 4.5rem;
+    min-width: 4.5rem; /* Shrunk slightly for mobile */
 }
 button.send-btn.stop { background-color: var(--error); }
 
@@ -297,6 +258,7 @@ button.send-btn.stop { background-color: var(--error); }
 .modal-content {
     background-color: var(--chat-bg); padding: 1.5rem; border-radius: 0.5rem; max-width: 90%; width: 500px;
     display: flex; flex-direction: column; gap: 1rem; max-height: 90vh; overflow-y: auto;
+    box-sizing: border-box;
 }
 .modal-content h2 { margin-top: 0; font-size: 1.25rem; color: var(--text-main); }
 .modal-content h2.error { color: var(--error); }
@@ -306,6 +268,7 @@ button.send-btn.stop { background-color: var(--error); }
 .field {
     padding: 0.75rem; border-radius: 0.5rem; background: var(--bg-color);
     color: white; border: 1px solid #475569; font-family: inherit; font-size: 1rem;
+    box-sizing: border-box;
 }
 textarea.field { resize: vertical; }
 .code-block { background-color: #0f172a; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.5rem 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a5b4fc; }
@@ -313,52 +276,23 @@ textarea.field { resize: vertical; }
 /* --- MOBILE RESPONSIVENESS --- */
 @media (max-width: 768px) {
     #menu-btn { display: block; }
-    #sidebar-close { display: block; }
 
     #sidebar {
         position: fixed;
         top: 0;
         left: 0;
         height: 100%;
-        width: min(280px, 82vw);
-        flex-basis: auto;
         transform: translateX(-100%);
-        padding-top: calc(1rem + env(safe-area-inset-top, 0px));
-        padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
     }
 
     #sidebar.open { transform: translateX(0); }
 
     #sidebar-overlay.open { display: block; }
 
-    /* Reclaim the horizontal space the desktop padding wastes on a
-       360px-wide phone: this is ~32px back per message. */
-    header { padding: 0.75rem; padding-top: calc(0.75rem + env(safe-area-inset-top, 0px)); }
-    header h1 { font-size: 1.05rem; }
-    .header-left { gap: 0.6rem; }
-    /* Wide enough for the longest model name ("GallaSonnet 1 Pro"): 45% of a
-       360px header clipped it. The title beside it ellipsizes instead, which
-       costs nothing -- it is decoration, the model in use is not. */
-    select { padding: 0.4rem; max-width: 165px; }
-
-    #chat-container { padding: 0.75rem; gap: 0.75rem; }
-    .message { max-width: 92%; padding: 0.75rem; }
-
+    .message { max-width: 95%; }
+    
     .input-area {
-        padding: 0.75rem;
-        padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+        padding: 0.75rem; /* Give a little more breathing room on small screens */
     }
-    button.send-btn { padding: 0.75rem 0.9rem; min-width: 0; }
 }
 
-/* Below this the version number is the first thing worth losing: it buys
-   the title enough room to sit beside the Gem badge without clipping. */
-@media (max-width: 420px) {
-    .title-version { display: none; }
-}
-
-/* The hidden version number frees enough room that the model name no
-   longer has to be clipped to fit beside it. */
-@media (max-width: 360px) {
-    header h1 { font-size: 1rem; }
-}
