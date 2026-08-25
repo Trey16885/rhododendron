@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- viewport-fit=cover so env(safe-area-inset-*) reports real values on
+         notched/gesture-bar phones; interactive-widget makes Chrome resize the
+         layout when the on-screen keyboard opens instead of covering it. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <meta name="color-scheme" content="dark">
     <title>Rhododendron 2.0</title>
     <!-- Inline icon: avoids a 404 round-trip for /favicon.ico on every load -->
@@ -35,9 +38,19 @@
             color: var(--text-main);
             margin: 0;
             display: flex;
+            /* 100vh on mobile Chrome/Safari is the viewport with the URL bar
+               HIDDEN, so the composer at the bottom of the column sat below the
+               visible area -- and overflow:hidden meant you could not scroll to
+               it. dvh tracks the actually-visible height instead. */
             height: 100vh;
+            height: 100dvh;
             overflow: hidden;
+            overscroll-behavior: none;
         }
+
+        /* Set only while the on-screen keyboard is up, from the visual viewport,
+           for browsers that don't honour interactive-widget=resizes-content. */
+        body.keyboard-open { height: var(--app-height); }
 
         /* Sidebar Styles */
         #sidebar {
@@ -54,6 +67,21 @@
         }
 
         .sidebar-section { margin-bottom: 1.5rem; }
+
+        /* The open sidebar covers the hamburger, so on a phone the only way to
+           dismiss it was a sliver of overlay down the right edge. */
+        #sidebar-close {
+            display: none;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.75rem;
+            line-height: 1;
+            padding: 0 0.25rem;
+            margin: -0.25rem 0 0.5rem auto;
+            cursor: pointer;
+        }
+        #sidebar-close:hover { color: var(--text-main); }
 
         .sidebar-title {
             font-size: 0.8rem;
@@ -113,11 +141,15 @@
         header {
             background-color: var(--chat-bg);
             padding: 1rem;
+            padding-top: calc(1rem + env(safe-area-inset-top, 0px));
+            padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+            padding-right: calc(1rem + env(safe-area-inset-right, 0px));
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 0.5rem;
             border-bottom: 1px solid var(--border);
+            flex: 0 0 auto;
         }
 
         .header-left {
@@ -159,9 +191,16 @@
 
         #chat-container {
             flex: 1;
+            /* Without this the transcript refuses to shrink below its content
+               height and shoves the composer off the bottom of the screen. */
+            min-height: 0;
             overflow-y: auto;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
             overflow-wrap: anywhere;
             padding: 1rem;
+            padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+            padding-right: calc(1rem + env(safe-area-inset-right, 0px));
             display: flex;
             flex-direction: column;
             gap: 1rem;
@@ -215,9 +254,14 @@
         .input-area {
             display: flex;
             padding: 1rem;
+            /* Clear the home indicator / gesture bar. */
+            padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+            padding-left: calc(1rem + env(safe-area-inset-left, 0px));
+            padding-right: calc(1rem + env(safe-area-inset-right, 0px));
             background-color: var(--chat-bg);
             border-top: 1px solid var(--border);
             gap: 0.5rem;
+            flex: 0 0 auto;
         }
 
         input[type="text"] {
@@ -282,22 +326,52 @@
         /* --- MOBILE RESPONSIVENESS --- */
         @media (max-width: 768px) {
             #menu-btn { display: block; }
+            #sidebar-close { display: block; }
 
             #sidebar {
                 position: fixed;
                 top: 0;
                 left: 0;
                 height: 100%;
+                width: min(280px, 82vw);
+                flex-basis: auto;
                 transform: translateX(-100%);
+                padding-top: calc(1rem + env(safe-area-inset-top, 0px));
+                padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
             }
 
             #sidebar.open { transform: translateX(0); }
 
             #sidebar-overlay.open { display: block; }
 
-            header h1 { max-width: 45vw; }
+            /* Reclaim the horizontal space the desktop padding wastes on a
+               360px-wide phone: this is ~32px back per message. */
+            header { padding: 0.75rem; padding-top: calc(0.75rem + env(safe-area-inset-top, 0px)); }
+            header h1 { font-size: 1.05rem; }
+            .header-left { gap: 0.6rem; }
+            select { max-width: 130px; font-size: 0.9rem; padding: 0.4rem; }
 
-            .message { max-width: 95%; }
+            #chat-container { padding: 0.75rem; gap: 0.75rem; }
+            .message { max-width: 92%; padding: 0.75rem; }
+
+            .input-area {
+                padding: 0.75rem;
+                padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+            }
+            button.send-btn { padding: 0.75rem 0.9rem; min-width: 0; }
+        }
+
+        /* Below this the version number is the first thing worth losing: it buys
+           the title enough room to sit beside the Gem badge without clipping. */
+        @media (max-width: 420px) {
+            .title-version { display: none; }
+        }
+
+        /* The hidden version number frees enough room that the model name no
+           longer has to be clipped to fit beside it. */
+        @media (max-width: 360px) {
+            header h1 { font-size: 1rem; }
+            select { max-width: 124px; }
         }
     </style>
 </head>
@@ -308,6 +382,7 @@
 
     <!-- Sidebar: Chats, Gems, Data -->
     <div id="sidebar">
+        <button id="sidebar-close" aria-label="Close menu">&times;</button>
         <button class="sidebar-btn new-btn" id="new-chat-btn">+ New Chat</button>
 
         <div class="sidebar-section" style="margin-top: 1rem;">
@@ -334,7 +409,8 @@
         <header>
             <div class="header-left">
                 <button id="menu-btn" aria-label="Toggle sidebar" aria-expanded="false">☰</button>
-                <h1 id="header-title">Rhododendron 2.0</h1>
+                <h1 id="header-title">Rhododendron<span class="title-version"> 2.0</span></h1>
+                <span id="gem-badge" title="A Gem is active" hidden>💎</span>
             </div>
             <select id="model-select" aria-label="Model">
                 <option value="rhododendron/galla:opus-1">GallaOpus 1</option>
@@ -768,7 +844,9 @@
         }
 
         function updateHeaderTitle() {
-            els.headerTitle.textContent = state.activeGemId ? "Rhododendron 2.0 (Gem Active)" : "Rhododendron 2.0";
+            // A badge rather than a "(Gem Active)" suffix: on a phone the longer
+            // title just truncated to nothing readable.
+            els.gemBadge.hidden = !state.activeGemId;
         }
 
         function activateGem(id) {
@@ -1190,6 +1268,47 @@
             }
         }
 
+        // ---------------------------------------------------------------- Viewport
+        // Chrome honours interactive-widget=resizes-content, but Safari and older
+        // Android browsers leave the layout at full height and let the keyboard
+        // cover the composer. Measure the visual viewport and pin the app to it
+        // while the keyboard is up. The threshold keeps the collapsing URL bar
+        // (a much smaller delta) from resizing the layout on every scroll.
+        const KEYBOARD_MIN_DELTA = 120;
+
+        function syncViewportHeight() {
+            const vv = window.visualViewport;
+            if (!vv) return;
+            const keyboardOpen = window.innerHeight - vv.height > KEYBOARD_MIN_DELTA;
+            if (keyboardOpen) {
+                document.documentElement.style.setProperty("--app-height", vv.height + "px");
+                document.body.classList.add("keyboard-open");
+            } else {
+                document.documentElement.style.removeProperty("--app-height");
+                document.body.classList.remove("keyboard-open");
+            }
+        }
+
+        function watchViewport() {
+            const vv = window.visualViewport;
+            if (!vv) return;
+            let queued = false;
+            const onChange = () => {
+                if (queued) return;
+                queued = true;
+                requestAnimationFrame(() => {
+                    queued = false;
+                    const stick = isNearBottom();
+                    syncViewportHeight();
+                    // Keep the newest message in view as the keyboard opens.
+                    if (stick) scrollToBottom();
+                });
+            };
+            vv.addEventListener("resize", onChange);
+            vv.addEventListener("scroll", onChange);
+            syncViewportHeight();
+        }
+
         // -------------------------------------------------------------------- Init
         function cacheElements() {
             const ids = {
@@ -1198,7 +1317,8 @@
                 headerTitle: "header-title", model: "model-select", input: "user-input",
                 sendBtn: "send-btn", gemName: "gem-name", gemPrompt: "gem-prompt",
                 importFile: "import-file", missingModelName: "missing-model-name",
-                pullCommand: "pull-command", triedEndpoints: "tried-endpoints"
+                pullCommand: "pull-command", triedEndpoints: "tried-endpoints",
+                gemBadge: "gem-badge", sidebarClose: "sidebar-close"
             };
             for (const key in ids) els[key] = document.getElementById(ids[key]);
         }
@@ -1206,6 +1326,7 @@
         function bindEvents() {
             els.menuBtn.addEventListener("click", () => toggleSidebar());
             els.overlay.addEventListener("click", () => toggleSidebar(false));
+            els.sidebarClose.addEventListener("click", () => toggleSidebar(false));
             document.getElementById("new-chat-btn").addEventListener("click", () => {
                 startNewChat().catch((err) => alert("Could not start a chat: " + err.message));
             });
@@ -1261,6 +1382,7 @@
         async function init() {
             cacheElements();
             bindEvents();
+            watchViewport();
 
             const savedModel = readSetting("model", null);
             if (savedModel && els.model.querySelector('option[value="' + CSS.escape(savedModel) + '"]')) {
