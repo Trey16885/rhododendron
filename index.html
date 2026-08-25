@@ -10,7 +10,10 @@
     <title>Rhododendron 2.0</title>
     <!-- Inline icon: avoids a 404 round-trip for /favicon.ico on every load -->
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%8C%B8%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="style.css">
+    <!-- ?v= is a cache buster: GitHub Pages serves these with max-age=600, so
+         without it a fresh index.html can pair with a stale script.js for ten
+         minutes and half the page stops working. Bump it when you edit either. -->
+    <link rel="stylesheet" href="style.css?v=5">
     <!-- Marked.js for Markdown parsing (version pinned so a CDN release can't break the API) -->
     <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
     <!-- JSZip for exporting and importing data -->
@@ -18,7 +21,7 @@
     <!-- A module so `vite build` can bundle it: as a plain classic script it was
          skipped entirely and dist/ shipped no JavaScript. Modules are deferred,
          so this still runs after the two libraries above. -->
-    <script type="module" src="./script.js"></script>
+    <script type="module" src="./script.js?v=5"></script>
 </head>
 <body>
 
@@ -91,7 +94,8 @@
         <div class="modal-content" role="dialog" aria-modal="true" aria-label="Ollama connection failed">
             <h2 class="error">Ollama Connection Failed</h2>
             <p>Rhododendron runs locally on your machine, but we couldn't connect to Ollama. Make sure it's installed and running with CORS allowed.</p>
-            <p style="color: var(--text-muted); font-size: 0.9rem; margin: 0;">Tried: <span id="tried-endpoints"></span></p>
+            <p style="margin: 0 0 0.25rem;">Tried:</p>
+            <ul id="tried-endpoints" class="tried-list"></ul>
 
             <h3>Termux (Android):</h3>
             <div class="code-block">pkg install -y ollama &amp;&amp; OLLAMA_ORIGINS="*" ollama serve</div>

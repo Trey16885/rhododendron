@@ -4,9 +4,13 @@
     // Endpoints are probed in order and the first one that answers serves the
     // rest of the session. The winner is remembered, so the next load tries the
     // endpoint that worked last time instead of waiting on a dead tunnel first.
+    // Your own machine first. The tunnel is a public third-party host, so
+    // preferring it meant a failed round-trip before every cold start (it
+    // currently answers 403), and any chat that did reach it would be leaving
+    // this machine. It stays as a fallback for when Ollama isn't local.
     const OLLAMA_ENDPOINTS = [
-        "https://ollama-tunnel.serveousercontent.com",
-        "http://localhost:11434"
+        "http://localhost:11434",
+        "https://ollama-tunnel.serveousercontent.com"
     ];
     let OLLAMA_URL = null;
     const DB_NAME = "RhododendronDB";
@@ -514,6 +518,23 @@
     // ------------------------------------------------------------ Ollama checks
     // Resolves to the tag listing from the first endpoint that answers, or null
     // when every one of them is unreachable.
+    // Why each endpoint failed, so the dialog can say something more useful than
+    // "make sure Ollama is running" when that isn't the problem.
+    const endpointFailures = [];
+
+    function describeFailure(base, err) {
+        if (err && err.name === "AbortError") return "no answer within " + (TAGS_TIMEOUT_MS / 1000) + "s";
+        if (err && /^HTTP \d/.test(err.message)) return err.message;
+        // fetch only ever reports "Failed to fetch" here, which covers refused,
+        // blocked-as-mixed-content and blocked-by-Private-Network-Access alike.
+        const local = /^http:\/\/(localhost|127\.0\.0\.1)/.test(base);
+        if (local && location.protocol === "https:") {
+            return "refused, or blocked because this page is served over HTTPS " +
+                   "and browsers restrict HTTPS pages from reaching http://localhost";
+        }
+        return "unreachable";
+    }
+
     async function resolveEndpoint() {
         const remembered = readSetting("endpoint", null);
         const ordered = OLLAMA_ENDPOINTS.slice();
@@ -523,6 +544,7 @@
             ordered.unshift(remembered);
         }
 
+        endpointFailures.length = 0;
         for (const base of ordered) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), TAGS_TIMEOUT_MS);
@@ -534,12 +556,15 @@
                 writeSetting("endpoint", base);
                 return data;
             } catch (err) {
-                /* unreachable or refused -- fall through to the next endpoint */
+                endpointFailures.push({ base: base, reason: describeFailure(base, err) });
             } finally {
                 clearTimeout(timer);
             }
         }
         OLLAMA_URL = null;
+        // A remembered endpoint that has stopped working must not be preferred
+        // forever, or every later load pays its timeout first.
+        writeSetting("endpoint", null);
         return null;
     }
 
@@ -548,7 +573,12 @@
 
         const data = await resolveEndpoint();
         if (!data) {
-            els.triedEndpoints.textContent = OLLAMA_ENDPOINTS.join(", ");
+            els.triedEndpoints.replaceChildren();
+            endpointFailures.forEach((f) => {
+                const li = document.createElement("li");
+                li.textContent = f.base + " — " + f.reason;
+                els.triedEndpoints.appendChild(li);
+            });
             openModal("cors-modal");
             return false;
         }

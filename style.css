@@ -308,7 +308,27 @@ button.send-btn.stop { background-color: var(--error); }
     color: white; border: 1px solid #475569; font-family: inherit; font-size: 1rem;
 }
 textarea.field { resize: vertical; }
-.code-block { background-color: #0f172a; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.5rem 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #a5b4fc; }
+.tried-list {
+    margin: 0;
+    padding-left: 1.25rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+.tried-list li { margin-bottom: 0.25rem; overflow-wrap: anywhere; }
+
+/* Wrap rather than scroll: these are commands to read and copy, and on a phone
+   the horizontal overflow hid most of every one of them. */
+.code-block {
+    background-color: #0f172a;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    margin: 0.5rem 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    color: #a5b4fc;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
 
 /* --- MOBILE RESPONSIVENESS --- */
 @media (max-width: 768px) {
