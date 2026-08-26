@@ -8,3 +8,14 @@ so the model keeps the SYSTEM instructions from its Modelfile.
 Galla uses Ollama
 **Markdown is supported in the chat**
 **Galla can make images using SVG**
+
+## Galla CLI
+
+Projects and publishing live in a small CLI, since a browser tab has no files:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Trey16885/rhododendron/main/CLI/install.sh | bash
+```
+
+Then `galla new my-site`, `galla open my-site`, `galla publish my-site`.
+See [CLI/README.md](CLI/README.md).

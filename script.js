@@ -691,20 +691,19 @@
     // window rather than a `system` message, so Ollama keeps the Modelfile's
     // own SYSTEM block instead of replacing it.
     const GALLA_INSTRUCTIONS = "[SYSTEM]\n" +
-        "Commands: /memory /recall /edit /create /publish\n" +
-        "Use of commands:\n" +
-        "/memory - Update memory\n" +
-        "/recall - recall memory you have added before\n" +
-        "/edit - edit files/folders\n" +
-        "/create - create files/folders\n" +
-        "/publish - zip every file in the workspace and publish it to a site " +
-        "(Output the published link formatted as domain.domain/?project=urlsafecharacters)\n" +
+        "Commands: /memory /recall\n" +
+        "/memory - remember something for future conversations\n" +
+        "/recall - list what you have been asked to remember\n" +
         "To run one, write it on a line of its own, e.g.\n" +
         "/memory Trey prefers short answers\n" +
         "The line is taken out of your reply, so do not also describe running " +
         "it. /memory is offered to the user to accept before it is stored. " +
         "Anything already listed under [MEMORY] is known to you and does not " +
-        "need recalling.\n\n";
+        "need recalling.\n" +
+        "Files, projects and publishing are not available in this chat: they " +
+        "live in the Galla CLI (galla new / galla open / galla publish). If " +
+        "asked to create, edit or publish files, say so rather than pretending " +
+        "to do it.\n\n";
 
     // ------------------------------------------------------------------ Memory
     // /memory and /recall are handled here, by the app, not by the model: the
@@ -730,12 +729,13 @@
             recent.map((m) => "- " + m.text).join("\n") + "\n\n";
     }
 
-    // Advertised to the model in GALLA_INSTRUCTIONS but not built yet. Caught
-    // here so Galla cannot be asked to do one and cheerfully claim it did.
-    const UNIMPLEMENTED_COMMANDS = {
-        edit: "editing files",
-        create: "creating files",
-        publish: "publishing a workspace"
+    // These moved to the Galla CLI, which has a filesystem and git to work
+    // with. Still caught here so asking for one in the chat gets an honest
+    // answer instead of the model improvising a result.
+    const CLI_COMMANDS = {
+        edit: "galla open <project>",
+        create: "galla new <project>",
+        publish: "galla publish <project>"
     };
 
     const KNOWN_COMMANDS = new Set(["memory", "recall", "edit", "create", "publish"]);
@@ -789,11 +789,12 @@
                    hits.map((m) => "• " + m.text).join("\n");
         }
 
-        if (UNIMPLEMENTED_COMMANDS[name]) {
-            return "/" + name + " isn't built yet, so nothing happened. " +
-                   UNIMPLEMENTED_COMMANDS[name].charAt(0).toUpperCase() +
-                   UNIMPLEMENTED_COMMANDS[name].slice(1) +
-                   " needs a workspace to act on, which the app doesn't have yet.";
+        if (CLI_COMMANDS[name]) {
+            return "/" + name + " lives in the Galla CLI, not in this chat — " +
+                   "a browser tab has no files to work on. In a terminal:\n\n" +
+                   CLI_COMMANDS[name] + "\n\nInstall it with:\n" +
+                   "curl -fsSL https://raw.githubusercontent.com/Trey16885/" +
+                   "rhododendron/main/CLI/install.sh | bash";
         }
 
         return null;
