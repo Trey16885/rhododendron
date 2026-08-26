@@ -375,19 +375,22 @@ publish_diverged() {
     local dir="$1" repo="$2" push_url="$3" name="$4"
     local gitc=(git -C "$dir" -c "user.name=${GALLA_USER:-Galla}"
                 -c "user.email=${GALLA_USER:-galla}@users.noreply.github.com")
+    # The branch we were refused on, which is the one to compare against --
+    # not the repo's default branch, which can be a different one entirely.
+    local base=main
 
     say ""
     say "$repo has work your copy doesn't - something else pushed to it,"
     say "most likely an edit made on github.com."
     say ""
     say "Fetching it to compare ..."
-    if ! git -C "$dir" fetch -q "$push_url" main 2>/dev/null; then
+    if ! git -C "$dir" fetch -q "$push_url" "$base" 2>/dev/null; then
         fail "could not fetch $repo to compare against. Check your connection."
     fi
 
     if "${gitc[@]}" merge --no-edit -q FETCH_HEAD >/dev/null 2>&1; then
         local err
-        if err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+        if err="$(git -C "$dir" push -q "$push_url" "$base" 2>&1)"; then
             say "They didn't overlap, so both are in. Pushed."
             return 0
         fi
@@ -430,7 +433,7 @@ publish_diverged() {
             warn "galla: could not combine them that way. Falling back to a branch."
         else
             local err
-            if err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+            if err="$(git -C "$dir" push -q "$push_url" "$base" 2>&1)"; then
                 if [ "$strategy" = ours ]; then
                     say "Kept yours. Pushed."
                 else
@@ -455,37 +458,64 @@ publish_diverged() {
     say "Nothing already on $repo is changed or lost."
     say ""
     local err
-    if ! err="$(git -C "$dir" push -q "$push_url" "main:refs/heads/$branch" 2>&1)"; then
+    if ! err="$(git -C "$dir" push -q "$push_url" "$base:refs/heads/$branch" 2>&1)"; then
         warn "galla: could not push the branch:"
         printf '%s\n' "$err" | redact | sed 's/^/  /' >&2
         exit 1
     fi
     say "Pushed branch $branch"
 
-    local body pr_url
-    body="$(api_ok POST "/repos/$repo/pulls" \
-        "{\"title\":\"Changes from Galla ($branch)\",\"head\":\"$branch\",\"base\":\"main\",\"body\":\"Published from the Galla CLI. The same lines changed here and on main, so this is a pull request rather than a direct push - open the Files changed tab to see both versions.\"}" 2>/dev/null)" \
-        && pr_url="$(json_field "$body" html_url)" || pr_url=""
+    # Ask the API, then believe the status code -- not whether a URL could be
+    # parsed out of the reply. Keying the outcome off the parsed URL meant a
+    # created pull request whose link we failed to read was reported as a
+    # permission problem, sending you to add a permission you already had.
+    local payload raw code body pr_url=""
+    payload="{\"title\":\"Changes from Galla ($branch)\",\"head\":\"$branch\",\"base\":\"$base\",\"body\":\"Published from the Galla CLI. The same lines changed here and on $base, so this is a pull request rather than a direct push - open the Files changed tab to see both versions.\"}"
+    raw="$(api POST "/repos/$repo/pulls" "$payload" 2>/dev/null || true)"
+    code="$(tail -n1 <<<"$raw")"
+    body="$(sed '$d' <<<"$raw")"
+    case "$code" in
+        2*) pr_url="$(json_field "$body" html_url)" || pr_url="" ;;
+    esac
 
     say ""
-    if [ -n "$pr_url" ]; then
-        say "Opened a pull request:"
-        say "  $pr_url"
-        say ""
-        say "Open it, look at 'Files changed', and merge it if it looks right."
-    else
-        # Creating one needs Pull requests: Read and write. Without it the
-        # branch is still safely pushed, and GitHub will open the same
-        # comparison from a URL.
-        say "Couldn't open the pull request itself"
-        [ -n "$body" ] && say "  ($(json_field "$body" message))"
-        say ""
-        say "The branch is pushed, so open it here instead:"
-        say "  https://github.com/$repo/compare/main...$branch"
-        say ""
-        say "(Adding 'Pull requests: Read and write' to the token lets galla"
-        say " open it for you next time.)"
-    fi
+    case "$code" in
+        2*)
+            if [ -n "$pr_url" ]; then
+                say "Opened a pull request:"
+                say "  $pr_url"
+            else
+                # Created -- we just could not find the link in the reply.
+                say "Opened a pull request. It is here:"
+                say "  https://github.com/$repo/pulls"
+            fi
+            say ""
+            say "Open it, look at 'Files changed', and merge it if it looks right."
+            ;;
+        403|401)
+            say "GitHub refused to open the pull request:"
+            say "  $code $(json_field "$body" message)"
+            say ""
+            say "That is the token. It needs Pull requests: Read and write, and"
+            say "the repository access has to cover $repo. 'galla doctor $name'"
+            say "reports what GitHub says to each."
+            say ""
+            say "The branch is pushed either way, so you can open it here:"
+            say "  https://github.com/$repo/compare/$base...$branch"
+            ;;
+        *)
+            # 422 is the common one: no commits between the two, or a pull
+            # request for this branch already exists. Neither is about the
+            # token, and saying so would send you to check the wrong thing.
+            say "Couldn't open the pull request:"
+            say "  ${code:-no response} $(json_field "$body" message)"
+            local detail; detail="$(json_field "$body" errors)"
+            [ -n "$detail" ] && say "  $detail"
+            say ""
+            say "The branch is pushed, so nothing is lost. Open it here:"
+            say "  https://github.com/$repo/compare/$base...$branch"
+            ;;
+    esac
 
     say ""
     say "Until that is merged, 'galla publish $name' will land here again -"
