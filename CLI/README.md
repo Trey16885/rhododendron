@@ -35,6 +35,18 @@ galla list                  # what you have
 `galla auth` asks for a GitHub personal access token — make one at
 <https://github.com/settings/tokens/new> with the **repo** scope.
 
+There are three ways to give it, so an awkward terminal is never a dead end:
+
+```sh
+galla auth                      # prompts; each character shows as a dot
+galla auth ghp_your_token       # pass it straight in
+GALLA_TOKEN=ghp_your_token galla auth
+```
+
+At the prompt the token is masked, not invisible: you will see a dot per
+character, so you can tell a paste registered. Press **Enter** to finish — a
+paste without a trailing newline waits, as any prompt would.
+
 It is saved in `~/.galla/config`, readable only by you (`chmod 600`), and stays
 saved until you replace it by running `galla auth` again. It is deliberately
 never written into a project's git remote: `.git/config` is world-readable and
