@@ -1,31 +1,44 @@
 (function () {
     "use strict";
 
-    // We use an array of endpoints and a dynamic active URL variable.
+    // Endpoints are probed in order and the first one that answers serves the
+    // rest of the session. The winner is remembered, so the next load tries the
+    // endpoint that worked last time instead of waiting on a dead tunnel first.
+    // Your own machine first. The tunnel is a public third-party host, so
+    // preferring it meant a failed round-trip before every cold start (it
+    // currently answers 403), and any chat that did reach it would be leaving
+    // this machine. It stays as a fallback for when Ollama isn't local.
     const OLLAMA_ENDPOINTS = [
-        "https://ollama-tunnel.serveousercontent.com",
-        "http://localhost:11434"
+        "http://localhost:11434",
+        "https://ollama-tunnel.serveousercontent.com"
     ];
-    let OLLAMA_URL = null; // Will be set to the working endpoint dynamically
-
+    let OLLAMA_URL = null;
     const DB_NAME = "RhododendronDB";
-    const DB_VERSION = 1;
+    // 2 adds the "memories" store. onupgradeneeded creates only what is
+    // missing, so an existing v1 database keeps its chats and gems.
+    const DB_VERSION = 2;
     const EXPORT_FILENAME = "rhododendron_export.json";
+    // Cap how much history is replayed to the model so long chats don't grow
+    // the request (and the latency) without bound.
     const MAX_CONTEXT_MESSAGES = 60;
+    const MAX_MEMORIES_INJECTED = 50;
     const STREAM_PAINT_MS = 60;
+    const STREAM_PAINT_MAX_MS = 500;
     const TAGS_TIMEOUT_MS = 5000;
 
+    // --- Cached DOM references (previously re-queried on every keystroke/message) ---
     const els = {};
     const state = {
         db: null,
         currentChatId: null,
         activeGemId: null,
         activeGemPrompt: "",
-        sending: false,
+        busy: false,
         controller: null
     };
     const verifiedModels = new Set();
 
+    // ---------------------------------------------------------------- IndexedDB
     const dbReady = new Promise((resolve, reject) => {
         let request;
         try {
@@ -38,16 +51,26 @@
             const db = e.target.result;
             if (!db.objectStoreNames.contains("chats")) db.createObjectStore("chats", { keyPath: "id" });
             if (!db.objectStoreNames.contains("gems")) db.createObjectStore("gems", { keyPath: "id" });
+            if (!db.objectStoreNames.contains("memories")) db.createObjectStore("memories", { keyPath: "id" });
         };
         request.onsuccess = (e) => {
             state.db = e.target.result;
+            // If another tab loads a newer version, hold the upgrade open and
+            // this tab blocks it forever. Step aside instead.
+            state.db.onversionchange = () => {
+                state.db.close();
+                state.db = null;
+            };
             resolve(state.db);
         };
+        // Without these the whole app silently died with "db is undefined".
         request.onerror = () => reject(request.error || new Error("IndexedDB unavailable"));
         request.onblocked = () => reject(new Error("IndexedDB is blocked by another tab"));
     });
 
     async function idbRequest(storeName, mode, run) {
+        // Awaiting here means UI actions fired before the database finishes
+        // opening queue up instead of failing with "db is undefined".
         await dbReady;
         return new Promise((resolve, reject) => {
             let tx;
@@ -68,20 +91,24 @@
     const idbGet = (store, key) => idbRequest(store, "readonly", (s) => s.get(key));
     const idbGetAll = (store) => idbRequest(store, "readonly", (s) => s.getAll());
     const idbPut = (store, value) => idbRequest(store, "readwrite", (s) => s.put(value));
+    const idbDelete = (store, key) => idbRequest(store, "readwrite", (s) => s.delete(key));
 
     async function idbPutMany(entries) {
         await dbReady;
         return new Promise((resolve, reject) => {
-            const tx = state.db.transaction(["chats", "gems"], "readwrite");
+            const tx = state.db.transaction(["chats", "gems", "memories"], "readwrite");
             const chats = tx.objectStore("chats");
             const gems = tx.objectStore("gems");
+            const memories = tx.objectStore("memories");
             entries.chats.forEach((c) => chats.put(c));
             entries.gems.forEach((g) => gems.put(g));
+            (entries.memories || []).forEach((m) => memories.put(m));
             tx.oncomplete = () => resolve();
             tx.onabort = tx.onerror = () => reject(tx.error || new Error("Import failed"));
         });
     }
 
+    // ------------------------------------------------------------------ Helpers
     function generateId() {
         if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
         return Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -89,6 +116,7 @@
 
     function makeTitle(text) {
         const clean = text.replace(/\s+/g, " ").trim();
+        // The old version appended "..." even when nothing was truncated.
         return clean.length > 25 ? clean.slice(0, 25) + "…" : clean;
     }
 
@@ -107,7 +135,7 @@
         try {
             if (value === null || value === undefined) localStorage.removeItem(key);
             else localStorage.setItem(key, value);
-        } catch (err) {}
+        } catch (err) { /* private mode: settings just don't persist */ }
     }
 
     function downloadBlob(blob, filename) {
@@ -116,20 +144,29 @@
         a.href = url;
         a.download = filename;
         a.style.display = "none";
+        // Firefox ignores click() on a link that isn't in the document.
         document.body.appendChild(a);
         a.click();
         a.remove();
+        // The old code leaked every object URL it created.
         setTimeout(() => URL.revokeObjectURL(url), 30000);
     }
+
+    // -------------------------------------------------------------- Sanitizing
+    // Model output (and imported chat archives) are untrusted: they get parsed
+    // as Markdown and injected as HTML, so strip anything executable while
+    // keeping the inline SVG that the SVG-drawing feature depends on.
     const FORBIDDEN_TAGS = new Set([
         "SCRIPT", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "BASE",
         "FORM", "INPUT", "BUTTON", "TEXTAREA", "SELECT", "STYLE", "FOREIGNOBJECT"
     ]);
     const SAFE_URI = /^(?:https?:|mailto:|tel:|#|\/|\.|data:image\/(?:png|jpeg|jpg|gif|webp);base64,)/i;
     const URI_ATTRS = new Set(["href", "src", "xlink:href", "action", "formaction", "poster"]);
+    const ANIMATION_TAGS = new Set(["ANIMATE", "SET", "ANIMATEMOTION", "ANIMATETRANSFORM"]);
 
     function sanitizeToFragment(html) {
         const tpl = document.createElement("template");
+        // Template content is inert: no scripts run and no images are fetched.
         tpl.innerHTML = html;
         const doomed = [];
         const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_ELEMENT);
@@ -145,6 +182,15 @@
                 } else if (name === "style" && /expression\s*\(|url\s*\(|@import/i.test(attr.value)) {
                     el.removeAttribute(attr.name);
                 }
+            }
+            // SMIL can rewrite an attribute after sanitizing, so
+            // <a><animate attributeName="href" values="javascript:..."></a>
+            // smuggles a live link past the URL check above. Animation that
+            // targets anything else (a drawing moving, fading, morphing) is
+            // left alone.
+            if (ANIMATION_TAGS.has(el.tagName.toUpperCase())) {
+                const target = (el.getAttribute("attributeName") || "").toLowerCase();
+                if (target.startsWith("on") || URI_ATTRS.has(target)) { doomed.push(el); continue; }
             }
             if (el.tagName === "A" && el.getAttribute("href")) {
                 el.setAttribute("target", "_blank");
@@ -164,11 +210,13 @@
                 html = "<p>" + escapeHtml(text) + "</p>";
             }
         } else {
+            // CDN blocked or offline: still show the message instead of throwing.
             html = "<p>" + escapeHtml(text).replace(/\n/g, "<br>") + "</p>";
         }
         return sanitizeToFragment(html);
     }
 
+    // ------------------------------------------------------------------- SVG
     function serializeSvg(svg) {
         const clone = svg.cloneNode(true);
         if (!clone.getAttribute("xmlns")) clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
@@ -180,6 +228,10 @@
         btn.className = "svg-btn";
         btn.type = "button";
         btn.textContent = "Download SVG";
+        // Closes over the element instead of looking it up by a timestamp id --
+        // those ids collided whenever two messages rendered in the same
+        // millisecond (i.e. every time a saved chat was reopened), so the
+        // button downloaded the wrong drawing.
         btn.addEventListener("click", () => {
             downloadBlob(new Blob([serializeSvg(svg)], { type: "image/svg+xml" }), "rhododendron_image.svg");
         });
@@ -196,11 +248,16 @@
     }
 
     function enhanceSvgs(container) {
+        // Raw SVG that Markdown already passed through: wrap it once, in place.
+        // (The old regex appended a *second* copy of every inline drawing.)
         container.querySelectorAll("svg").forEach((svg) => {
             if (svg.parentElement && svg.parentElement.classList.contains("svg-render")) return;
+            // Only wrap top-level drawings: pulling a nested <svg> out of its
+            // parent would break the image it belongs to.
             if (svg.parentElement && svg.parentElement.closest("svg")) return;
             wrapSvg(svg, null);
         });
+        // SVG inside a fenced code block: keep the source, render a preview below.
         container.querySelectorAll("pre > code").forEach((code) => {
             const src = code.textContent.trim();
             if (!/^<svg[\s>]/i.test(src) || !/<\/svg>$/i.test(src)) return;
@@ -209,6 +266,7 @@
         });
     }
 
+    // --------------------------------------------------------------- Rendering
     function appendBubble(sender) {
         const div = document.createElement("div");
         div.className = "message " + (sender === "user" ? "user-message" : "ai-message");
@@ -232,6 +290,57 @@
         return fillBubble(appendBubble(sender), sender, text);
     }
 
+    // A write Galla asked for, held until you agree. Deliberately not persisted
+    // while pending: a reload drops the offer rather than leaving a live button
+    // for something you never saw proposed.
+    function renderConfirm(promptText, onAccept) {
+        const div = document.createElement("div");
+        div.className = "note-message confirm-note";
+
+        const label = document.createElement("div");
+        label.textContent = promptText;
+        div.appendChild(label);
+
+        const row = document.createElement("div");
+        row.className = "confirm-actions";
+        const yes = document.createElement("button");
+        yes.type = "button";
+        yes.className = "confirm-btn";
+        yes.textContent = "Remember it";
+        const no = document.createElement("button");
+        no.type = "button";
+        no.className = "confirm-btn secondary";
+        no.textContent = "No thanks";
+        row.append(yes, no);
+        div.appendChild(row);
+
+        const settle = (text) => {
+            div.classList.remove("confirm-note");
+            div.replaceChildren();
+            div.textContent = text;
+        };
+        yes.addEventListener("click", async () => {
+            row.remove();
+            settle(await onAccept());
+        });
+        no.addEventListener("click", () => settle("Not remembered."));
+
+        els.chatContainer.appendChild(div);
+        scrollToBottom();
+        return div;
+    }
+
+    // App-level output (command results). Kept out of the model's context by
+    // buildApiMessages so it never looks like something the assistant said.
+    function renderNote(text) {
+        const div = document.createElement("div");
+        div.className = "note-message";
+        div.textContent = text;
+        els.chatContainer.appendChild(div);
+        scrollToBottom();
+        return div;
+    }
+
     function scrollToBottom() {
         els.chatContainer.scrollTop = els.chatContainer.scrollHeight;
     }
@@ -241,6 +350,7 @@
         return c.scrollHeight - c.scrollTop - c.clientHeight < 120;
     }
 
+    // ------------------------------------------------------------------ Modals
     function openModal(id) {
         const modal = document.getElementById(id);
         if (modal) modal.classList.add("open");
@@ -257,6 +367,7 @@
         return false;
     }
 
+    // ----------------------------------------------------------------- Sidebar
     function toggleSidebar(force) {
         const open = force === undefined ? !els.sidebar.classList.contains("open") : force;
         els.sidebar.classList.toggle("open", open);
@@ -269,6 +380,7 @@
     }
 
     function markActive(listEl, datasetKey, activeValue) {
+        // Update highlighting without re-reading the whole database.
         for (const btn of listEl.children) {
             btn.classList.toggle("active", (btn.dataset[datasetKey] || null) === activeValue);
         }
@@ -322,7 +434,9 @@
     }
 
     function updateHeaderTitle() {
-        els.headerTitle.textContent = state.activeGemId ? "Rhododendron 2.0 (Gem Active)" : "Rhododendron 2.0";
+        // A badge rather than a "(Gem Active)" suffix: on a phone the longer
+        // title just truncated to nothing readable.
+        els.gemBadge.hidden = !state.activeGemId;
     }
 
     function activateGem(id) {
@@ -338,7 +452,42 @@
         updateHeaderTitle();
     }
 
+    // ------------------------------------------------------------------- Chats
+    function isEmptyChat(chat) {
+        return !!chat && (!Array.isArray(chat.messages) || chat.messages.length === 0);
+    }
+
+    // Empty conversations are worthless to keep: every stray "+ New Chat" click
+    // used to leave another "New Chat" row in the sidebar forever.
+    async function pruneEmptyChats(keepId) {
+        const chats = await idbGetAll("chats");
+        const stale = chats.filter((c) => c.id !== keepId && isEmptyChat(c));
+        for (const c of stale) await idbDelete("chats", c.id);
+        return stale.length;
+    }
+
+    async function loadOrCreateChat(id) {
+        const chat = (await idbGet("chats", id)) ||
+            { id: id, title: "New Chat", messages: [], timestamp: Date.now() };
+        if (!Array.isArray(chat.messages)) chat.messages = [];
+        return chat;
+    }
+
     async function startNewChat({ silent = false } = {}) {
+        // Reuse the current conversation while it's still empty rather than
+        // stacking up identical blank rows.
+        if (state.currentChatId) {
+            const current = await idbGet("chats", state.currentChatId).catch(() => null);
+            if (isEmptyChat(current)) {
+                if (!silent) {
+                    els.chatContainer.replaceChildren();
+                    closeSidebarOnMobile();
+                }
+                markActive(els.chatList, "chatId", state.currentChatId);
+                return state.currentChatId;
+            }
+        }
+
         const id = generateId();
         await idbPut("chats", { id, title: "New Chat", messages: [], timestamp: Date.now() });
         state.currentChatId = id;
@@ -355,15 +504,20 @@
         const chat = await idbGet("chats", id);
         state.currentChatId = id;
         writeSetting("lastChatId", id);
+        // Build off-screen and attach once instead of forcing a reflow per message.
         const frag = document.createDocumentFragment();
         const svgHosts = [];
         if (chat && Array.isArray(chat.messages)) {
             chat.messages.forEach((m) => {
                 const div = document.createElement("div");
-                div.className = "message " + (m.sender === "user" ? "user-message" : "ai-message");
-                if (m.sender === "user") {
+                if (m.sender === "note") {
+                    div.className = "note-message";
+                    div.textContent = m.text;
+                } else if (m.sender === "user") {
+                    div.className = "message user-message";
                     div.textContent = m.text;
                 } else {
+                    div.className = "message ai-message";
                     div.appendChild(renderMarkdown(m.text || ""));
                     svgHosts.push(div);
                 }
@@ -377,6 +531,7 @@
         closeSidebarOnMobile();
     }
 
+    // -------------------------------------------------------------------- Gems
     async function saveGem() {
         const name = els.gemName.value.trim();
         const prompt = els.gemPrompt.value.trim();
@@ -385,7 +540,7 @@
         try {
             await idbPut("gems", { id: generateId(), name, systemPrompt: prompt });
         } catch (err) {
-            console.error("Could not save the Gem:", err);
+            alert("Could not save the Gem: " + err.message);
             return;
         }
         closeModal("gem-modal");
@@ -394,25 +549,28 @@
         await loadGemList();
     }
 
+    // --------------------------------------------------------- Export / Import
     async function exportData() {
         if (typeof JSZip === "undefined") {
-            console.error("The export library failed to load.");
+            alert("The export library failed to load. Check your internet connection and reload.");
             return;
         }
         try {
-            const [chats, gems] = await Promise.all([idbGetAll("chats"), idbGetAll("gems")]);
+            const [chats, gems, memories] = await Promise.all([
+                idbGetAll("chats"), idbGetAll("gems"), idbGetAll("memories")
+            ]);
             const zip = new JSZip();
-            zip.file(EXPORT_FILENAME, JSON.stringify({ chats, gems }));
+            zip.file(EXPORT_FILENAME, JSON.stringify({ chats, gems, memories }));
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
             downloadBlob(blob, "Rhododendron_Data.zip");
         } catch (err) {
-            console.error("Export failed:", err);
+            alert("Export failed: " + err.message);
         }
     }
 
     async function importData(file) {
         if (typeof JSZip === "undefined") {
-            console.error("The import library failed to load.");
+            alert("The import library failed to load. Check your internet connection and reload.");
             return;
         }
         try {
@@ -423,46 +581,93 @@
             const data = JSON.parse(await entry.async("string"));
             const chats = Array.isArray(data && data.chats) ? data.chats.filter((c) => c && c.id) : [];
             const gems = Array.isArray(data && data.gems) ? data.gems.filter((g) => g && g.id) : [];
-            if (!chats.length && !gems.length) throw new Error("the archive contains no chats or gems");
+            // Archives written before memories existed simply have none.
+            const memories = Array.isArray(data && data.memories)
+                ? data.memories.filter((m) => m && m.id && typeof m.text === "string") : [];
+            if (!chats.length && !gems.length && !memories.length) {
+                throw new Error("the archive contains no chats, gems or memories");
+            }
 
-            await idbPutMany({ chats, gems });
+            await idbPutMany({ chats, gems, memories });
             await loadSidebar();
-            console.log("Imported " + chats.length + " chat(s) and " + gems.length + " gem(s).");
+            alert("Imported " + chats.length + " chat(s), " + gems.length + " gem(s) and " +
+                  memories.length + " memor" + (memories.length === 1 ? "y" : "ies") + ".");
         } catch (err) {
-            console.error("Import failed:", err);
+            alert("Import failed: " + err.message);
         }
     }
-    // --- Multi-endpoint connection check ---
-    async function ensureModelReady(modelName) {
-        if (verifiedModels.has(modelName) && OLLAMA_URL) return true;
 
-        let data;
-        let successUrl = null;
+    // ------------------------------------------------------------ Ollama checks
+    // Resolves to the tag listing from the first endpoint that answers, or null
+    // when every one of them is unreachable.
+    // Why each endpoint failed, so the dialog can say something more useful than
+    // "make sure Ollama is running" when that isn't the problem.
+    const endpointFailures = [];
 
-        for (const url of OLLAMA_ENDPOINTS) {
+    function describeFailure(base, err) {
+        if (err && err.name === "AbortError") return "no answer within " + (TAGS_TIMEOUT_MS / 1000) + "s";
+        if (err && /^HTTP \d/.test(err.message)) return err.message;
+        // fetch only ever reports "Failed to fetch" here, which covers refused,
+        // blocked-as-mixed-content and blocked-by-Private-Network-Access alike.
+        const local = /^http:\/\/(localhost|127\.0\.0\.1)/.test(base);
+        if (local && location.protocol === "https:") {
+            return "refused, or blocked because this page is served over HTTPS " +
+                   "and browsers restrict HTTPS pages from reaching http://localhost";
+        }
+        return "unreachable";
+    }
+
+    async function resolveEndpoint() {
+        const remembered = readSetting("endpoint", null);
+        const ordered = OLLAMA_ENDPOINTS.slice();
+        const seen = ordered.indexOf(remembered);
+        if (seen > 0) {
+            ordered.splice(seen, 1);
+            ordered.unshift(remembered);
+        }
+
+        endpointFailures.length = 0;
+        for (const base of ordered) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), TAGS_TIMEOUT_MS);
             try {
-                const res = await fetch(url + "/api/tags", { signal: controller.signal });
-                if (res.ok) {
-                    data = await res.json();
-                    successUrl = url;
-                    clearTimeout(timer);
-                    break;
-                }
+                const res = await fetch(base + "/api/tags", { signal: controller.signal });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                const data = await res.json();
+                // Verification is per endpoint: a model confirmed on localhost
+                // says nothing about what the tunnel has, so switching hosts
+                // has to re-check rather than trust the old answer.
+                if (OLLAMA_URL !== base) verifiedModels.clear();
+                OLLAMA_URL = base;
+                writeSetting("endpoint", base);
+                return data;
             } catch (err) {
-                // Silently try next endpoint
+                endpointFailures.push({ base: base, reason: describeFailure(base, err) });
             } finally {
                 clearTimeout(timer);
             }
         }
+        OLLAMA_URL = null;
+        // A remembered endpoint that has stopped working must not be preferred
+        // forever, or every later load pays its timeout first.
+        writeSetting("endpoint", null);
+        return null;
+    }
 
-        if (!successUrl) {
+    async function ensureModelReady(modelName) {
+        if (OLLAMA_URL && verifiedModels.has(modelName)) return true;
+
+        const data = await resolveEndpoint();
+        if (!data) {
+            els.triedEndpoints.replaceChildren();
+            endpointFailures.forEach((f) => {
+                const li = document.createElement("li");
+                li.textContent = f.base + " — " + f.reason;
+                els.triedEndpoints.appendChild(li);
+            });
             openModal("cors-modal");
             return false;
         }
-
-        OLLAMA_URL = successUrl;
 
         const strip = (n) => String(n).replace(/:latest$/, "");
         const models = data && Array.isArray(data.models) ? data.models : [];
@@ -477,41 +682,155 @@
         return true;
     }
 
-    function buildApiMessages(chat) {
-        const messages = [];
-        
-        // Define Galla's built-in memory and workspace commands
-        const gallaInstructions = `[SYSTEM]
-Commands: /memory /recall /edit /create /publish
-Use of commands:
-/memory - Update memory
-/recall - recall memory you have added before 
-/edit - edit files/folders
-/create - create files/folders
-/publish - zip every file in the workspace and publish it to a site (Output the published link formatted as domain.domain/?project=urlsafecharacters)\n\n`;
+    // ---------------------------------------------------------------- Messaging
+    // A Gem's instructions ride along as an ordinary user turn -- never as a
+    // `system` message. Ollama replaces the Modelfile's SYSTEM block whenever a
+    // request carries one, which would throw away Galla's own instructions and
+    // leave the Gem talking to a bare base model.
+    // Galla's built-in workspace commands. Rides in the first user turn of the
+    // window rather than a `system` message, so Ollama keeps the Modelfile's
+    // own SYSTEM block instead of replacing it.
+    const GALLA_INSTRUCTIONS = "[SYSTEM]\n" +
+        "Commands: /memory /recall /edit /create /publish\n" +
+        "Use of commands:\n" +
+        "/memory - Update memory\n" +
+        "/recall - recall memory you have added before\n" +
+        "/edit - edit files/folders\n" +
+        "/create - create files/folders\n" +
+        "/publish - zip every file in the workspace and publish it to a site " +
+        "(Output the published link formatted as domain.domain/?project=urlsafecharacters)\n" +
+        "To run one, write it on a line of its own, e.g.\n" +
+        "/memory Trey prefers short answers\n" +
+        "The line is taken out of your reply, so do not also describe running " +
+        "it. /memory is offered to the user to accept before it is stored. " +
+        "Anything already listed under [MEMORY] is known to you and does not " +
+        "need recalling.\n\n";
 
-        // Check if there are active Gem instructions
-        let gemInstruction = "";
-        if (state.activeGemId && state.activeGemPrompt) {
-            gemInstruction = `[Apply these custom instructions for this chat: ${state.activeGemPrompt}]\n\n`;
+    // ------------------------------------------------------------------ Memory
+    // /memory and /recall are handled here, by the app, not by the model: the
+    // model is only told the commands exist, and could not write to storage on
+    // its own. Handling them locally makes them deterministic.
+    async function loadMemories() {
+        const all = await idbGetAll("memories").catch(() => []);
+        return all.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    }
+
+    async function saveMemory(text) {
+        const entry = { id: generateId(), text: text, timestamp: Date.now() };
+        await idbPut("memories", entry);
+        return entry;
+    }
+
+    function formatMemoryBlock(memories) {
+        if (!memories.length) return "";
+        // Only the newest are carried: every one of these rides in the request,
+        // so an unbounded list would grow the prompt without limit.
+        const recent = memories.slice(-MAX_MEMORIES_INJECTED);
+        return "[MEMORY] What you have been asked to remember:\n" +
+            recent.map((m) => "- " + m.text).join("\n") + "\n\n";
+    }
+
+    // Advertised to the model in GALLA_INSTRUCTIONS but not built yet. Caught
+    // here so Galla cannot be asked to do one and cheerfully claim it did.
+    const UNIMPLEMENTED_COMMANDS = {
+        edit: "editing files",
+        create: "creating files",
+        publish: "publishing a workspace"
+    };
+
+    const KNOWN_COMMANDS = new Set(["memory", "recall", "edit", "create", "publish"]);
+
+    // Pulls command lines out of a reply, leaving the prose. Lines inside a
+    // fenced code block are left alone: a model showing you what /memory looks
+    // like in an example must not thereby run it.
+    function extractCommands(text) {
+        const commands = [];
+        const kept = [];
+        let inFence = false;
+        for (const line of text.split("\n")) {
+            if (/^\s*```/.test(line)) { inFence = !inFence; kept.push(line); continue; }
+            const m = inFence ? null : /^\s*\/(\w+)(?:[ \t]+([\s\S]*))?$/.exec(line);
+            if (m && KNOWN_COMMANDS.has(m[1].toLowerCase())) {
+                commands.push(line.trim());
+                continue;
+            }
+            kept.push(line);
+        }
+        return { text: kept.join("\n"), commands: commands };
+    }
+
+    // Returns the text to show, or null when this isn't a command at all (so a
+    // message that merely starts with a slash, like a path, still goes to the
+    // model).
+    async function runCommand(text) {
+        const match = /^\/(\w+)\s*([\s\S]*)$/.exec(text);
+        if (!match) return null;
+        const name = match[1].toLowerCase();
+        const arg = match[2].trim();
+
+        if (name === "memory") {
+            if (!arg) return "Usage: /memory <something to remember>";
+            await saveMemory(arg);
+            const all = await loadMemories();
+            return "Remembered. " + all.length + " memor" + (all.length === 1 ? "y" : "ies") +
+                   " stored, and included in every conversation from now on.";
         }
 
-        const history = chat.messages.slice(-MAX_CONTEXT_MESSAGES);
-        let firstUserFound = false;
+        if (name === "recall") {
+            const all = await loadMemories();
+            const hits = arg
+                ? all.filter((m) => m.text.toLowerCase().includes(arg.toLowerCase()))
+                : all;
+            if (!hits.length) {
+                return arg ? "Nothing remembered matching “" + arg + "”."
+                           : "Nothing remembered yet. Use /memory <something> to add one.";
+            }
+            return (arg ? "Matching memories:\n" : "Everything remembered:\n") +
+                   hits.map((m) => "• " + m.text).join("\n");
+        }
 
+        if (UNIMPLEMENTED_COMMANDS[name]) {
+            return "/" + name + " isn't built yet, so nothing happened. " +
+                   UNIMPLEMENTED_COMMANDS[name].charAt(0).toUpperCase() +
+                   UNIMPLEMENTED_COMMANDS[name].slice(1) +
+                   " needs a workspace to act on, which the app doesn't have yet.";
+        }
+
+        return null;
+    }
+
+    async function resolveGemPrompt() {
+        if (!state.activeGemId) return "";
+        if (state.activeGemPrompt) return state.activeGemPrompt;
+        // The cache isn't populated yet if the Gem was picked a moment ago.
+        const gem = await idbGet("gems", state.activeGemId).catch(() => null);
+        state.activeGemPrompt = (gem && gem.systemPrompt) || "";
+        return state.activeGemPrompt;
+    }
+
+    function buildApiMessages(chat, gemPrompt, memories) {
+        const messages = [];
+        const gemInstruction = gemPrompt
+            ? "[Apply these custom instructions for this chat: " + gemPrompt + "]\n\n"
+            : "";
+        const preamble = GALLA_INSTRUCTIONS + formatMemoryBlock(memories || []) + gemInstruction;
+
+        // Command results are app output, not conversation: replaying them
+        // would read as things the assistant had said.
+        const history = chat.messages
+            .filter((m) => m && !m.command && m.sender !== "note")
+            .slice(-MAX_CONTEXT_MESSAGES);
+        let injected = false;
         for (const m of history) {
             let content = m.text;
-            
-            // Inject the system/memory prompt directly into the first user message 
-            // to ensure it doesn't override the primary Modelfile system prompt.
-            if (m.sender === "user" && !firstUserFound) {
-                content = gallaInstructions + gemInstruction + content;
-                firstUserFound = true;
+            // Prepend to the first user turn only: repeating it on every turn
+            // would re-send the whole block once per message.
+            if (m.sender === "user" && !injected) {
+                content = preamble + content;
+                injected = true;
             }
-            
             messages.push({ role: m.sender === "user" ? "user" : "assistant", content: content });
         }
-        
         return messages;
     }
 
@@ -528,7 +847,7 @@ Use of commands:
             try {
                 const body = await res.json();
                 detail = body && body.error ? ": " + body.error : "";
-            } catch (err) {}
+            } catch (err) { /* body wasn't JSON */ }
             throw new Error("Ollama returned HTTP " + res.status + detail);
         }
 
@@ -547,18 +866,28 @@ Use of commands:
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
-            for (;;) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                let idx;
-                while ((idx = buffer.indexOf("\n")) !== -1) {
-                    consume(buffer.slice(0, idx));
-                    buffer = buffer.slice(idx + 1);
+            try {
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    // Walk the buffer with an index instead of re-slicing it per
+                    // line, which rebuilt the whole string on every token.
+                    let start = 0;
+                    let idx;
+                    while ((idx = buffer.indexOf("\n", start)) !== -1) {
+                        consume(buffer.slice(start, idx));
+                        start = idx + 1;
+                    }
+                    buffer = buffer.slice(start);
                 }
+                buffer += decoder.decode();
+                consume(buffer);
+            } finally {
+                // An error thrown out of consume() used to leave the response
+                // body open, holding the connection until GC caught up.
+                reader.cancel().catch(() => {});
             }
-            buffer += decoder.decode();
-            consume(buffer);
         } else {
             (await res.text()).split("\n").forEach(consume);
         }
@@ -566,111 +895,242 @@ Use of commands:
     }
 
     function setSending(sending) {
-        state.sending = sending;
         els.sendBtn.textContent = sending ? "Stop" : "Send";
         els.sendBtn.classList.toggle("stop", sending);
+        els.sendBtn.setAttribute("aria-label", sending ? "Stop generating" : "Send message");
     }
 
-    async function persistAiReply(chatId, text) {
+    async function persistAiReply(chatId, text, notes) {
+        // Re-read instead of reusing the copy captured before the request:
+        // the stored chat may have moved on while the model was generating.
         const fresh = (await idbGet("chats", chatId)) || null;
         if (!fresh) return;
         if (!Array.isArray(fresh.messages)) fresh.messages = [];
-        fresh.messages.push({ sender: "ai", text });
+        // The command lines are already stripped: storing the raw reply would
+        // re-feed Galla its own commands as context.
+        if (text) fresh.messages.push({ sender: "ai", text: text });
+        (notes || []).forEach((n) => fresh.messages.push({ sender: "note", text: n }));
         fresh.timestamp = Date.now();
         await idbPut("chats", fresh);
     }
 
     async function sendMessage() {
-        if (state.sending) {
-            if (state.controller) state.controller.abort();
-            return;
-        }
+        // The button doubles as "Stop" once a response is in flight.
+        if (state.controller) { state.controller.abort(); return; }
+        // Set synchronously: `sending` used to be set only after several awaits,
+        // so two quick clicks fired two requests for the same message.
+        if (state.busy) return;
 
         const text = els.input.value.trim();
         if (!text) return;
 
-        try { await dbReady; } catch (err) {
-            console.error("Storage is unavailable, so chats can't be saved:", err);
-            return;
-        }
-
-        els.input.value = "";
-        const welcome = document.getElementById("welcome-message");
-        if (welcome) welcome.remove();
-
-        if (!state.currentChatId) await startNewChat({ silent: true });
-
-        let chat = await idbGet("chats", state.currentChatId);
-        if (!chat) chat = { id: state.currentChatId, title: "New Chat", messages: [], timestamp: Date.now() };
-        if (!Array.isArray(chat.messages)) chat.messages = [];
-
-        const isFirstMessage = chat.messages.length === 0;
-        if (isFirstMessage) chat.title = makeTitle(text);
-        chat.messages.push({ sender: "user", text });
-        chat.timestamp = Date.now();
-        await idbPut("chats", chat);
-
-        renderMessage("user", text);
-        if (isFirstMessage) await loadChatList();
+        state.busy = true;
+        setSending(true);
 
         const model = els.model.value;
-        const bubble = appendBubble("ai");
-        bubble.textContent = "Thinking…";
-
-        setSending(true);
-        const controller = new AbortController();
-        state.controller = controller;
-
+        let chatId = null;
+        let bubble = null;
         let full = "";
+
         try {
-            if (!(await ensureModelReady(model))) { bubble.remove(); return; }
+            try { await dbReady; } catch (err) {
+                alert("Storage is unavailable, so chats can't be saved: " + err.message);
+                return;
+            }
+
+            // Typed commands run immediately: you asking for something is not a
+            // request that needs confirming. They never reach Ollama, so they
+            // work whether or not it is running.
+            if (text.startsWith("/")) {
+                const result = await runCommand(text);
+                if (result !== null) {
+                    els.input.value = "";
+                    const welcomeNow = document.getElementById("welcome-message");
+                    if (welcomeNow) welcomeNow.remove();
+
+                    if (!state.currentChatId) await startNewChat({ silent: true });
+                    const cmdChat = await loadOrCreateChat(state.currentChatId);
+                    const firstInChat = cmdChat.messages.length === 0;
+                    if (firstInChat) cmdChat.title = makeTitle(text);
+                    cmdChat.messages.push({ sender: "user", text: text, command: true });
+                    cmdChat.messages.push({ sender: "note", text: result });
+                    cmdChat.timestamp = Date.now();
+                    await idbPut("chats", cmdChat);
+
+                    renderMessage("user", text);
+                    renderNote(result);
+                    if (firstInChat) await loadChatList();
+                    return;
+                }
+            }
+
+            // Check the connection and the model BEFORE the message is cleared
+            // from the box and written to the chat. Doing it last meant a failed
+            // check threw away what you had typed and left a user turn with no
+            // reply in the history, replayed as context on every later send.
+            if (!(await ensureModelReady(model))) return;
+
+            els.input.value = "";
+            const welcome = document.getElementById("welcome-message");
+            if (welcome) welcome.remove();
+
+            // startNewChat is asynchronous -- the old code fired it and immediately
+            // read back a chat that didn't exist yet, dropping the first message.
+            if (!state.currentChatId) await startNewChat({ silent: true });
+            // Pin the target: the user can open a different chat mid-stream, and
+            // the reply must land in the conversation it was asked in.
+            chatId = state.currentChatId;
+
+            const chat = await loadOrCreateChat(chatId);
+
+            const isFirstMessage = chat.messages.length === 0;
+            if (isFirstMessage) chat.title = makeTitle(text);
+            chat.messages.push({ sender: "user", text });
+            chat.timestamp = Date.now();
+            await idbPut("chats", chat);
+
+            renderMessage("user", text);
+            // Only rebuild the list when the title actually changed.
+            if (isFirstMessage) await loadChatList();
+
+            const [gemPrompt, memories] = await Promise.all([resolveGemPrompt(), loadMemories()]);
+            bubble = appendBubble("ai");
+            bubble.textContent = "Thinking…";
+            // Once the user navigates away this bubble is detached; skip the paints.
+            const onScreen = () => state.currentChatId === chatId && bubble.isConnected;
+
+            const controller = new AbortController();
+            state.controller = controller;
 
             let lastPaint = 0;
             await streamChat({
                 model,
-                messages: buildApiMessages(chat),
+                messages: buildApiMessages(chat, gemPrompt, memories),
                 signal: controller.signal,
                 onDelta: (acc) => {
                     full = acc;
+                    if (!onScreen()) return;
+                    // Re-parsing Markdown costs more as the reply grows, so back
+                    // the repaint rate off instead of doing it 16x a second.
+                    const wait = Math.min(STREAM_PAINT_MAX_MS, STREAM_PAINT_MS + full.length / 40);
                     const now = Date.now();
-                    if (now - lastPaint < STREAM_PAINT_MS) return;
+                    if (now - lastPaint < wait) return;
                     lastPaint = now;
                     const stick = isNearBottom();
+                    // SVG wrapping is skipped mid-stream: the markup is still partial.
                     fillBubble(bubble, "ai", full, { withSvg: false });
                     bubble.appendChild(Object.assign(document.createElement("span"), {
-                        className: "typing-cursor", textContent: "▍"
+                        className: "typing-cursor", textContent: "\u258D"
                     }));
                     if (stick) scrollToBottom();
                 }
             });
 
-            fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
-            scrollToBottom();
-            if (full.trim()) await persistAiReply(state.currentChatId, full);
+            // Commands Galla emitted on their own line are lifted out of the
+            // reply so the prose reads cleanly. Reads run straight away; writes
+            // are only ever proposed, because the model acts on whatever is in
+            // the conversation, including text you pasted in from elsewhere.
+            const parsed = extractCommands(full);
+            const notes = [];
+            const proposals = [];
+            for (const line of parsed.commands) {
+                if (/^\/memory\b/i.test(line)) { proposals.push(line); continue; }
+                const result = await runCommand(line);
+                if (result !== null) notes.push(result);
+            }
+
+            const prose = parsed.text.trim();
+            const hadCommands = notes.length > 0 || proposals.length > 0;
+            const display = prose || (hadCommands ? "" : "_(The model returned an empty response.)_");
+
+            if (onScreen()) {
+                if (display) {
+                    fillBubble(bubble, "ai", display);
+                } else {
+                    bubble.remove();   // the reply was nothing but commands
+                }
+                notes.forEach(renderNote);
+                proposals.forEach((line) => {
+                    const what = line.replace(/^\/memory\s*/i, "").trim();
+                    renderConfirm("Galla wants to remember: “" + what + "”", async () => {
+                        const result = await runCommand(line);
+                        await persistAiReply(chatId, "", [result]);
+                        return result;
+                    });
+                });
+                scrollToBottom();
+            }
+            if (display || notes.length) await persistAiReply(chatId, display, notes);
         } catch (err) {
             if (err.name === "AbortError") {
                 if (full.trim()) {
-                    fillBubble(bubble, "ai", full);
-                    await persistAiReply(state.currentChatId, full);
-                } else {
+                    if (bubble && bubble.isConnected) fillBubble(bubble, "ai", full);
+                    if (chatId) await persistAiReply(chatId, full);
+                } else if (bubble) {
                     bubble.remove();
                 }
-            } else {
+            } else if (bubble) {
                 bubble.classList.add("error-message");
                 bubble.textContent = "Error: " + err.message +
-                    " — make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
-                
-                // Reset verified state and force a re-check of endpoints if connection drops mid-chat
+                    " \u2014 make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
+                // The endpoint may have gone away (a tunnel dropping, Ollama
+                // being stopped), so re-probe from scratch on the next send.
                 verifiedModels.delete(model);
-                OLLAMA_URL = null; 
+                OLLAMA_URL = null;
+            } else {
+                alert("Something went wrong: " + err.message);
             }
         } finally {
             state.controller = null;
+            state.busy = false;
             setSending(false);
-            els.input.focus();
+            // Refocusing on a phone pops the keyboard back up over the answer.
+            if (window.innerWidth > 768) els.input.focus();
         }
     }
 
+    // ---------------------------------------------------------------- Viewport
+    // Chrome honours interactive-widget=resizes-content, but Safari and older
+    // Android browsers leave the layout at full height and let the keyboard
+    // cover the composer. Measure the visual viewport and pin the app to it
+    // while the keyboard is up. The threshold keeps the collapsing URL bar
+    // (a much smaller delta) from resizing the layout on every scroll.
+    const KEYBOARD_MIN_DELTA = 120;
+
+    function syncViewportHeight() {
+        const vv = window.visualViewport;
+        if (!vv) return;
+        const keyboardOpen = window.innerHeight - vv.height > KEYBOARD_MIN_DELTA;
+        if (keyboardOpen) {
+            document.documentElement.style.setProperty("--app-height", vv.height + "px");
+            document.body.classList.add("keyboard-open");
+        } else {
+            document.documentElement.style.removeProperty("--app-height");
+            document.body.classList.remove("keyboard-open");
+        }
+    }
+
+    function watchViewport() {
+        const vv = window.visualViewport;
+        if (!vv) return;
+        let queued = false;
+        const onChange = () => {
+            if (queued) return;
+            queued = true;
+            requestAnimationFrame(() => {
+                queued = false;
+                const stick = isNearBottom();
+                syncViewportHeight();
+                // Keep the newest message in view as the keyboard opens.
+                if (stick) scrollToBottom();
+            });
+        };
+        vv.addEventListener("resize", onChange);
+        vv.addEventListener("scroll", onChange);
+        syncViewportHeight();
+    }
+
+    // -------------------------------------------------------------------- Init
     function cacheElements() {
         const ids = {
             sidebar: "sidebar", overlay: "sidebar-overlay", menuBtn: "menu-btn",
@@ -678,7 +1138,8 @@ Use of commands:
             headerTitle: "header-title", model: "model-select", input: "user-input",
             sendBtn: "send-btn", gemName: "gem-name", gemPrompt: "gem-prompt",
             importFile: "import-file", missingModelName: "missing-model-name",
-            pullCommand: "pull-command"
+            pullCommand: "pull-command", triedEndpoints: "tried-endpoints",
+            gemBadge: "gem-badge", sidebarClose: "sidebar-close"
         };
         for (const key in ids) els[key] = document.getElementById(ids[key]);
     }
@@ -686,8 +1147,9 @@ Use of commands:
     function bindEvents() {
         els.menuBtn.addEventListener("click", () => toggleSidebar());
         els.overlay.addEventListener("click", () => toggleSidebar(false));
+        els.sidebarClose.addEventListener("click", () => toggleSidebar(false));
         document.getElementById("new-chat-btn").addEventListener("click", () => {
-            startNewChat().catch((err) => console.error("Could not start a chat:", err));
+            startNewChat().catch((err) => alert("Could not start a chat: " + err.message));
         });
         document.getElementById("create-gem-btn").addEventListener("click", () => {
             openModal("gem-modal");
@@ -701,12 +1163,14 @@ Use of commands:
             const file = e.target.files && e.target.files[0];
             if (!file) return;
             await importData(file);
+            // Reset so picking the same file again still fires "change".
             e.target.value = "";
         });
 
+        // Delegated: the sidebar lists are rebuilt constantly.
         els.chatList.addEventListener("click", (e) => {
             const btn = e.target.closest("button[data-chat-id]");
-            if (btn) loadChat(btn.dataset.chatId).catch((err) => console.error("Could not open chat:", err));
+            if (btn) loadChat(btn.dataset.chatId).catch((err) => alert("Could not open chat: " + err.message));
         });
         els.gemList.addEventListener("click", (e) => {
             const btn = e.target.closest("button");
@@ -715,6 +1179,7 @@ Use of commands:
 
         els.sendBtn.addEventListener("click", () => { sendMessage(); });
         els.input.addEventListener("keydown", (e) => {
+            // keypress is deprecated, and isComposing guards IME input.
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
                 e.preventDefault();
                 sendMessage();
@@ -738,6 +1203,7 @@ Use of commands:
     async function init() {
         cacheElements();
         bindEvents();
+        watchViewport();
 
         const savedModel = readSetting("model", null);
         if (savedModel && els.model.querySelector('option[value="' + CSS.escape(savedModel) + '"]')) {
@@ -753,9 +1219,11 @@ Use of commands:
         }
 
         state.activeGemId = readSetting("activeGemId", null) || null;
-        await loadSidebar();
 
         const lastChatId = readSetting("lastChatId", null);
+        await pruneEmptyChats(lastChatId).catch(() => {});
+        await loadSidebar();
+
         if (lastChatId && (await idbGet("chats", lastChatId))) await loadChat(lastChatId);
     }
 
