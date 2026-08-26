@@ -121,26 +121,44 @@ read_masked() {
 }
 
 # ------------------------------------------------------------------- auth
+# What to tick when making the token. Printed only when we are about to ask
+# for one -- someone who already has it in hand does not need the recipe.
+auth_instructions() {
+    say "Galla needs a GitHub fine-grained token to create repos and push."
+    say ""
+    say "Make one at: https://github.com/settings/personal-access-tokens/new"
+    say ""
+    say "  Repository access:  All repositories"
+    say "    One limited to selected repositories cannot create a new repo,"
+    say "    and would not cover a repo you make tomorrow."
+    say ""
+    say "  Repository permissions:"
+    say "    Contents          Read and write    push your files"
+    say "    Administration    Read and write    create the repository"
+    say "    Pages             Read and write    switch the site on"
+    say "    Metadata          Read-only         ticked for you already"
+    say ""
+    say "    Workflows too, if you want Actions later."
+    say ""
+    say "  Fine-grained tokens expire. When yours does, run 'galla auth' again."
+    say ""
+}
+
 cmd_auth() {
     load_config
-    say "Galla needs a GitHub personal access token to create repos and push."
-    say ""
-    say "Make one at: https://github.com/settings/tokens/new"
-    say "  - Classic token, with the 'repo' scope ticked"
-    say "  - 'workflow' too if you want Actions later"
-    say ""
-    if [ -n "$GALLA_PAT" ]; then
-        say "A token is already saved. Entering a new one replaces it."
-        say ""
-    fi
 
     # Three ways in, so a terminal that will not cooperate is never a dead end:
-    #   galla auth ghp_xxx        argument
-    #   GALLA_TOKEN=ghp_xxx galla auth   environment
-    #   the prompt below           typed or pasted
+    #   galla auth github_pat_xxx              argument
+    #   GALLA_TOKEN=github_pat_xxx galla auth  environment
+    #   the prompt below                       typed or pasted
     local token="${1:-${GALLA_TOKEN:-}}"
 
     if [ -z "$token" ]; then
+        auth_instructions
+        if [ -n "$GALLA_PAT" ]; then
+            say "A token is already saved. Entering a new one replaces it."
+            say ""
+        fi
         if [ -t 0 ]; then
             printf 'Paste your token, then press Enter: '
             token="$(read_masked)"
@@ -156,20 +174,35 @@ cmd_auth() {
         say "If pasting into the prompt does not work on your terminal, pass it"
         say "directly instead:"
         say ""
-        say "    galla auth ghp_your_token_here"
+        say "    galla auth github_pat_your_token_here"
         say ""
         exit 1
     fi
 
     GALLA_PAT="$token"
     local body login
-    body="$(api_ok GET /user)" || fail "GitHub rejected that token. Check it was copied whole and has the 'repo' scope."
+    body="$(api_ok GET /user)" ||
+        fail "GitHub rejected that token. Check it was copied whole, and that it hasn't expired."
     login="$(json_field "$body" login)"
     [ -n "$login" ] || fail "could not read the account for that token."
 
     GALLA_USER="$login"
     save_config
     say "Signed in as $GALLA_USER. Token saved to $CONFIG (readable only by you)."
+
+    # A classic token still works; the permissions above just aren't how it is
+    # described. Worth one line so a later refusal isn't a mystery.
+    case "$token" in
+        ghp_*|gho_*|ghu_*)
+            say ""
+            say "(That's a classic token. It works, but its scopes are named"
+            say " differently - if something later says it isn't allowed, start there.)"
+            ;;
+    esac
+
+    # Whether the permissions are right can't be read off the token: GitHub
+    # reports a fine-grained token's permissions nowhere, only refusals at the
+    # point of use. So the checks that matter live where they are used.
 }
 
 cmd_whoami() {
@@ -267,8 +300,16 @@ cmd_link() {
         if [ "$choice" = "n" ] || [ "$choice" = "N" ]; then
             say "Creating $GALLA_USER/$name ..."
             local created
-            created="$(api_ok POST /user/repos "{\"name\":\"$name\",\"private\":false,\"auto_init\":false}")" ||
-                fail "could not create the repository: $(json_field "$created" message)"
+            created="$(api_ok POST /user/repos "{\"name\":\"$name\",\"private\":false,\"auto_init\":false}")" || {
+                warn "galla: could not create the repository: $(json_field "$created" message)"
+                warn ""
+                warn "Creating a repo needs a fine-grained token with:"
+                warn "  Repository access     All repositories"
+                warn "  Administration        Read and write"
+                warn ""
+                warn "Or make the repo on github.com and run: galla link $name owner/repo"
+                exit 1
+            }
             repo="$(json_field "$created" full_name)"
         else
             repo="$(sed -n "${choice}p" <<<"$list")"
@@ -331,7 +372,7 @@ cmd_publish() {
     esac
 
     if ! git -C "$dir" push -q "$push_url" main 2>/dev/null; then
-        fail "push failed. Check the token still has 'repo' scope and that you can write to $repo."
+        fail "push failed. The token needs Contents: Read and write on $repo, and must not have expired."
     fi
     say "Pushed."
 
@@ -352,9 +393,10 @@ cmd_publish() {
         say "Live at: $site"
         say "The first build takes about a minute."
     else
-        # Fine-grained tokens often lack the Pages permission; the manual route
-        # always works.
-        say "Couldn't switch Pages on with this token - do it once by hand:"
+        # Pages: Read and write is the permission for this, and it is the one
+        # people most often leave off. The manual route always works.
+        say "Couldn't switch Pages on with this token."
+        say "(Add 'Pages: Read and write' to it, or just do it once by hand:)"
         say ""
         say "  1. Open https://github.com/$repo/settings/pages"
         say "  2. Under 'Build and deployment', set Source to 'Deploy from a branch'"
