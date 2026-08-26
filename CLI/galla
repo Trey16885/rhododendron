@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# Galla CLI - make projects, resume them, and publish them to GitHub Pages.
+set -euo pipefail
+
+VERSION="1.0.0"
+WORKSPACE="${GALLA_HOME:-$HOME/Galla}"
+CONFIG_DIR="${GALLA_CONFIG_DIR:-$HOME/.galla}"
+CONFIG="$CONFIG_DIR/config"
+API="${GALLA_API:-https://api.github.com}"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+fail() { printf 'galla: %s\n' "$*" >&2; exit 1; }
+
+for dep in git curl; do
+    command -v "$dep" >/dev/null 2>&1 || fail "$dep is required but not installed."
+done
+
+# ----------------------------------------------------------------- config
+# The token lives in one file, readable only by you. It is deliberately never
+# written into a git remote: .git/config is world-readable and gets copied
+# around with the project.
+load_config() {
+    GALLA_PAT=""; GALLA_USER=""
+    # Must not end on a failed test: under `set -e` a function returning
+    # non-zero takes the whole script down, which on a first run (no config
+    # yet) killed every command before it printed anything.
+    if [ -f "$CONFIG" ]; then . "$CONFIG"; fi
+    return 0
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    umask 077
+    {
+        printf 'GALLA_PAT=%s\n' "$(printf '%q' "$GALLA_PAT")"
+        printf 'GALLA_USER=%s\n' "$(printf '%q' "$GALLA_USER")"
+    } > "$CONFIG"
+    chmod 600 "$CONFIG"
+}
+
+# Minimal field reader so this works on a phone without jq installed.
+json_field() { grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" <<<"$1" | head -n1 | sed 's/.*:[[:space:]]*"//; s/"$//'; }
+json_all()   { grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" <<<"$1" | sed 's/.*:[[:space:]]*"//; s/"$//'; }
+
+api() {
+    local method="$1" path="$2" body="${3:-}"
+    local args=(-sS -X "$method"
+        -H "Accept: application/vnd.github+json"
+        -H "X-GitHub-Api-Version: 2022-11-28"
+        -H "Authorization: Bearer $GALLA_PAT"
+        -w '\n%{http_code}')
+    [ -n "$body" ] && args+=(-H "Content-Type: application/json" -d "$body")
+    curl "${args[@]}" "$API$path"
+}
+
+api_ok() {   # prints the body, returns non-zero on an HTTP error
+    local out code
+    out="$(api "$@")" || return 1
+    code="$(tail -n1 <<<"$out")"
+    out="$(sed '$d' <<<"$out")"
+    printf '%s' "$out"
+    [ "$code" -ge 200 ] && [ "$code" -lt 300 ]
+}
+
+require_auth() {
+    load_config
+    [ -n "$GALLA_PAT" ] || fail "no GitHub token saved yet. Run 'galla auth' first."
+}
+
+# ------------------------------------------------------------------ paths
+project_dir() { printf '%s/%s' "$WORKSPACE" "$1"; }
+
+require_project() {
+    local dir; dir="$(project_dir "$1")"
+    [ -d "$dir" ] || fail "no project called '$1'. 'galla list' shows what you have."
+    printf '%s' "$dir"
+}
+
+project_repo() {   # owner/name this project is linked to, if any
+    local dir="$1"
+    [ -f "$dir/.galla/repo" ] && cat "$dir/.galla/repo" || true
+}
+
+# .galla is Galla's own bookkeeping. Without this it gets committed and
+# published to the repository along with the site.
+ensure_gitignore() {
+    local dir="$1"
+    if [ ! -f "$dir/.gitignore" ] || ! grep -qx '\.galla/' "$dir/.gitignore" 2>/dev/null; then
+        printf '.galla/\n' >> "$dir/.gitignore"
+    fi
+    # Self-heal a project created before this rule existed.
+    if git -C "$dir" ls-files --error-unmatch .galla >/dev/null 2>&1; then
+        git -C "$dir" rm -r --cached -q .galla
+    fi
+}
+
+# ------------------------------------------------------------------- auth
+cmd_auth() {
+    load_config
+    say "Galla needs a GitHub personal access token to create repos and push."
+    say ""
+    say "Make one at: https://github.com/settings/tokens/new"
+    say "  - Classic token, with the 'repo' scope ticked"
+    say "  - 'workflow' too if you want Actions later"
+    say ""
+    if [ -n "$GALLA_PAT" ]; then
+        say "A token is already saved. Entering a new one replaces it."
+        say ""
+    fi
+
+    printf 'Paste your token (input hidden): '
+    local token=""
+    if [ -t 0 ]; then read -rs token; say ""; else read -r token; fi
+    [ -n "$token" ] || fail "no token entered, nothing changed."
+
+    GALLA_PAT="$token"
+    local body login
+    body="$(api_ok GET /user)" || fail "GitHub rejected that token. Check it was copied whole and has the 'repo' scope."
+    login="$(json_field "$body" login)"
+    [ -n "$login" ] || fail "could not read the account for that token."
+
+    GALLA_USER="$login"
+    save_config
+    say "Signed in as $GALLA_USER. Token saved to $CONFIG (readable only by you)."
+}
+
+cmd_whoami() {
+    require_auth
+    say "$GALLA_USER"
+    say "token: $CONFIG"
+}
+
+# --------------------------------------------------------------- projects
+cmd_new() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "usage: galla new <name>"
+    case "$name" in */*|.*) fail "'$name' is not a valid project name." ;; esac
+
+    local dir; dir="$(project_dir "$name")"
+    if [ -e "$dir" ]; then fail "'$name' already exists. 'galla open $name' to resume it."; fi
+
+    mkdir -p "$dir/.galla"
+    cat > "$dir/index.html" <<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>$name</title>
+</head>
+<body>
+<h1>$name</h1>
+<p>Made with Galla.</p>
+</body>
+</html>
+HTML
+    printf '# %s\n\nMade with Galla.\n' "$name" > "$dir/README.md"
+    ensure_gitignore "$dir"
+
+    git -C "$dir" init -q
+    git -C "$dir" symbolic-ref HEAD refs/heads/main
+    git -C "$dir" add -A
+    git -C "$dir" -c user.name="Galla" -c user.email="galla@localhost" \
+        commit -qm "Start $name" || true
+
+    say "Created $dir"
+    say ""
+    say "  galla open $name        work on it"
+    say "  galla link $name        attach a GitHub repo"
+    say "  galla publish $name     push it live"
+}
+
+cmd_list() {
+    [ -d "$WORKSPACE" ] || { say "No projects yet. 'galla new <name>' makes one."; return; }
+    local found=0 dir name repo
+    for dir in "$WORKSPACE"/*/; do
+        [ -d "$dir" ] || continue
+        found=1
+        name="$(basename "$dir")"
+        repo="$(project_repo "${dir%/}")"
+        if [ -n "$repo" ]; then
+            printf '  %-24s %s\n' "$name" "$repo"
+        else
+            printf '  %-24s %s\n' "$name" "(not linked)"
+        fi
+    done
+    [ "$found" -eq 1 ] || say "No projects yet. 'galla new <name>' makes one."
+}
+
+cmd_open() {
+    local name="${1:-}"
+    [ -n "$name" ] || fail "usage: galla open <name>"
+    local dir; dir="$(require_project "$name")"
+    say "Opening $dir - type 'exit' to come back."
+    cd "$dir"
+    exec "${SHELL:-/bin/bash}"
+}
+
+# ------------------------------------------------------------------- link
+cmd_link() {
+    require_auth
+    local name="${1:-}" repo="${2:-}"
+    [ -n "$name" ] || fail "usage: galla link <project> [owner/repo]"
+    local dir; dir="$(require_project "$name")"
+
+    if [ -z "$repo" ]; then
+        say "Your repositories:"
+        local body list i=1
+        body="$(api_ok GET "/user/repos?per_page=100&sort=updated")" ||
+            fail "could not list your repositories."
+        list="$(json_all "$body" full_name)"
+        if [ -n "$list" ]; then
+            while IFS= read -r r; do printf '  %2d) %s\n' "$i" "$r"; i=$((i+1)); done <<<"$list"
+        fi
+        say "   n) create a new repository called '$name'"
+        say ""
+        printf 'Pick a number, or n: '
+        local choice; read -r choice
+        if [ "$choice" = "n" ] || [ "$choice" = "N" ]; then
+            say "Creating $GALLA_USER/$name ..."
+            local created
+            created="$(api_ok POST /user/repos "{\"name\":\"$name\",\"private\":false,\"auto_init\":false}")" ||
+                fail "could not create the repository: $(json_field "$created" message)"
+            repo="$(json_field "$created" full_name)"
+        else
+            repo="$(sed -n "${choice}p" <<<"$list")"
+            [ -n "$repo" ] || fail "'$choice' wasn't one of the options."
+        fi
+    fi
+
+    mkdir -p "$dir/.galla"
+    printf '%s' "$repo" > "$dir/.galla/repo"
+    # No token in the remote: it is added only for the seconds a push takes.
+    git -C "$dir" remote remove origin 2>/dev/null || true
+    git -C "$dir" remote add origin "https://github.com/$repo.git"
+
+    say "Linked '$name' to $repo"
+    say "Next: galla publish $name"
+}
+
+# ---------------------------------------------------------------- publish
+pages_url() {
+    local repo="$1" owner name
+    owner="$(printf '%s' "${repo%%/*}" | tr '[:upper:]' '[:lower:]')"
+    name="${repo##*/}"
+    printf 'https://%s.github.io/%s/' "$owner" "$name"
+}
+
+cmd_publish() {
+    require_auth
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] || fail "usage: galla publish <project> [message]"
+    local dir; dir="$(require_project "$name")"
+    local msg="${*:-Update $name}"
+
+    local repo; repo="$(project_repo "$dir")"
+    [ -n "$repo" ] || fail "'$name' isn't linked to a repository yet. Run 'galla link $name'."
+
+    ensure_gitignore "$dir"
+    git -C "$dir" add -A
+    if git -C "$dir" diff --cached --quiet 2>/dev/null; then
+        say "Nothing changed since the last publish."
+    else
+        git -C "$dir" -c user.name="${GALLA_USER:-Galla}" \
+            -c user.email="${GALLA_USER:-galla}@users.noreply.github.com" \
+            commit -qm "$msg"
+        say "Committed: $msg"
+    fi
+
+    git -C "$dir" branch -M main
+    say "Pushing to $repo ..."
+
+    # The token is interpolated into this one command and never stored, and
+    # only for github.com -- any other remote keeps whatever auth it already
+    # has rather than being handed a GitHub token.
+    local remote push_url
+    remote="$(git -C "$dir" remote get-url origin)"
+    push_url="$remote"
+    case "$remote" in
+        https://github.com/*)
+            push_url="https://x-access-token:$GALLA_PAT@github.com/${remote#https://github.com/}"
+            ;;
+    esac
+
+    if ! git -C "$dir" push -q "$push_url" main 2>/dev/null; then
+        fail "push failed. Check the token still has 'repo' scope and that you can write to $repo."
+    fi
+    say "Pushed."
+
+    local site; site="$(pages_url "$repo")"
+    local existing
+    if existing="$(api_ok GET "/repos/$repo/pages" 2>/dev/null)"; then
+        say ""
+        say "Live at: $site"
+        say "Your change appears in about a minute."
+        return
+    fi
+
+    say ""
+    say "Turning on GitHub Pages ..."
+    if api_ok POST "/repos/$repo/pages" '{"source":{"branch":"main","path":"/"}}' >/dev/null 2>&1; then
+        say "Pages is on."
+        say ""
+        say "Live at: $site"
+        say "The first build takes about a minute."
+    else
+        # Fine-grained tokens often lack the Pages permission; the manual route
+        # always works.
+        say "Couldn't switch Pages on with this token - do it once by hand:"
+        say ""
+        say "  1. Open https://github.com/$repo/settings/pages"
+        say "  2. Under 'Build and deployment', set Source to 'Deploy from a branch'"
+        say "  3. Pick branch 'main' and folder '/ (root)', then Save"
+        say "  4. Wait about a minute for the link to appear"
+        say ""
+        say "It will be: $site"
+    fi
+    say ""
+    say "From now on 'galla publish $name' updates the site in about a minute."
+}
+
+cmd_help() {
+    cat <<EOF
+galla $VERSION - make things and put them on the web.
+
+  galla new <name>              start a project in $WORKSPACE
+  galla list                    show your projects
+  galla open <name>             resume one (opens a shell in it)
+
+  galla auth                    save or replace your GitHub token
+  galla whoami                  show who you are signed in as
+  galla link <name> [owner/repo]  attach a repository (or create one)
+  galla publish <name> [message]  commit, push, and put it on GitHub Pages
+
+Projects live in $WORKSPACE
+Token lives in $CONFIG (readable only by you)
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        new)      cmd_new "$@" ;;
+        list|ls)  cmd_list "$@" ;;
+        open|resume) cmd_open "$@" ;;
+        auth|login)  cmd_auth "$@" ;;
+        whoami)   cmd_whoami "$@" ;;
+        link)     cmd_link "$@" ;;
+        publish)  cmd_publish "$@" ;;
+        help|-h|--help) cmd_help ;;
+        version|-v|--version) say "galla $VERSION" ;;
+        *) warn "galla: '$cmd' isn't a command."; say ""; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
