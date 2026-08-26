@@ -1,41 +1,31 @@
 (function () {
     "use strict";
 
-    // Endpoints are probed in order and the first one that answers serves the
-    // rest of the session. The winner is remembered, so the next load tries the
-    // endpoint that worked last time instead of waiting on a dead tunnel first.
-    // Your own machine first. The tunnel is a public third-party host, so
-    // preferring it meant a failed round-trip before every cold start (it
-    // currently answers 403), and any chat that did reach it would be leaving
-    // this machine. It stays as a fallback for when Ollama isn't local.
+    // We use an array of endpoints and a dynamic active URL variable.
     const OLLAMA_ENDPOINTS = [
-        "http://localhost:11434",
-        "https://ollama-tunnel.serveousercontent.com"
+        "https://ollama-tunnel.serveousercontent.com",
+        "http://localhost:11434"
     ];
-    let OLLAMA_URL = null;
+    let OLLAMA_URL = null; // Will be set to the working endpoint dynamically
+
     const DB_NAME = "RhododendronDB";
     const DB_VERSION = 1;
     const EXPORT_FILENAME = "rhododendron_export.json";
-    // Cap how much history is replayed to the model so long chats don't grow
-    // the request (and the latency) without bound.
     const MAX_CONTEXT_MESSAGES = 60;
     const STREAM_PAINT_MS = 60;
-    const STREAM_PAINT_MAX_MS = 500;
     const TAGS_TIMEOUT_MS = 5000;
 
-    // --- Cached DOM references (previously re-queried on every keystroke/message) ---
     const els = {};
     const state = {
         db: null,
         currentChatId: null,
         activeGemId: null,
         activeGemPrompt: "",
-        busy: false,
+        sending: false,
         controller: null
     };
     const verifiedModels = new Set();
 
-    // ---------------------------------------------------------------- IndexedDB
     const dbReady = new Promise((resolve, reject) => {
         let request;
         try {
@@ -53,14 +43,11 @@
             state.db = e.target.result;
             resolve(state.db);
         };
-        // Without these the whole app silently died with "db is undefined".
         request.onerror = () => reject(request.error || new Error("IndexedDB unavailable"));
         request.onblocked = () => reject(new Error("IndexedDB is blocked by another tab"));
     });
 
     async function idbRequest(storeName, mode, run) {
-        // Awaiting here means UI actions fired before the database finishes
-        // opening queue up instead of failing with "db is undefined".
         await dbReady;
         return new Promise((resolve, reject) => {
             let tx;
@@ -81,7 +68,6 @@
     const idbGet = (store, key) => idbRequest(store, "readonly", (s) => s.get(key));
     const idbGetAll = (store) => idbRequest(store, "readonly", (s) => s.getAll());
     const idbPut = (store, value) => idbRequest(store, "readwrite", (s) => s.put(value));
-    const idbDelete = (store, key) => idbRequest(store, "readwrite", (s) => s.delete(key));
 
     async function idbPutMany(entries) {
         await dbReady;
@@ -96,7 +82,6 @@
         });
     }
 
-    // ------------------------------------------------------------------ Helpers
     function generateId() {
         if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
         return Date.now().toString(36) + Math.random().toString(36).slice(2);
@@ -104,7 +89,6 @@
 
     function makeTitle(text) {
         const clean = text.replace(/\s+/g, " ").trim();
-        // The old version appended "..." even when nothing was truncated.
         return clean.length > 25 ? clean.slice(0, 25) + "…" : clean;
     }
 
@@ -123,7 +107,7 @@
         try {
             if (value === null || value === undefined) localStorage.removeItem(key);
             else localStorage.setItem(key, value);
-        } catch (err) { /* private mode: settings just don't persist */ }
+        } catch (err) {}
     }
 
     function downloadBlob(blob, filename) {
@@ -132,29 +116,20 @@
         a.href = url;
         a.download = filename;
         a.style.display = "none";
-        // Firefox ignores click() on a link that isn't in the document.
         document.body.appendChild(a);
         a.click();
         a.remove();
-        // The old code leaked every object URL it created.
         setTimeout(() => URL.revokeObjectURL(url), 30000);
     }
-
-    // -------------------------------------------------------------- Sanitizing
-    // Model output (and imported chat archives) are untrusted: they get parsed
-    // as Markdown and injected as HTML, so strip anything executable while
-    // keeping the inline SVG that the SVG-drawing feature depends on.
     const FORBIDDEN_TAGS = new Set([
         "SCRIPT", "IFRAME", "OBJECT", "EMBED", "LINK", "META", "BASE",
         "FORM", "INPUT", "BUTTON", "TEXTAREA", "SELECT", "STYLE", "FOREIGNOBJECT"
     ]);
     const SAFE_URI = /^(?:https?:|mailto:|tel:|#|\/|\.|data:image\/(?:png|jpeg|jpg|gif|webp);base64,)/i;
     const URI_ATTRS = new Set(["href", "src", "xlink:href", "action", "formaction", "poster"]);
-    const ANIMATION_TAGS = new Set(["ANIMATE", "SET", "ANIMATEMOTION", "ANIMATETRANSFORM"]);
 
     function sanitizeToFragment(html) {
         const tpl = document.createElement("template");
-        // Template content is inert: no scripts run and no images are fetched.
         tpl.innerHTML = html;
         const doomed = [];
         const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_ELEMENT);
@@ -170,15 +145,6 @@
                 } else if (name === "style" && /expression\s*\(|url\s*\(|@import/i.test(attr.value)) {
                     el.removeAttribute(attr.name);
                 }
-            }
-            // SMIL can rewrite an attribute after sanitizing, so
-            // <a><animate attributeName="href" values="javascript:..."></a>
-            // smuggles a live link past the URL check above. Animation that
-            // targets anything else (a drawing moving, fading, morphing) is
-            // left alone.
-            if (ANIMATION_TAGS.has(el.tagName.toUpperCase())) {
-                const target = (el.getAttribute("attributeName") || "").toLowerCase();
-                if (target.startsWith("on") || URI_ATTRS.has(target)) { doomed.push(el); continue; }
             }
             if (el.tagName === "A" && el.getAttribute("href")) {
                 el.setAttribute("target", "_blank");
@@ -198,13 +164,11 @@
                 html = "<p>" + escapeHtml(text) + "</p>";
             }
         } else {
-            // CDN blocked or offline: still show the message instead of throwing.
             html = "<p>" + escapeHtml(text).replace(/\n/g, "<br>") + "</p>";
         }
         return sanitizeToFragment(html);
     }
 
-    // ------------------------------------------------------------------- SVG
     function serializeSvg(svg) {
         const clone = svg.cloneNode(true);
         if (!clone.getAttribute("xmlns")) clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
@@ -216,10 +180,6 @@
         btn.className = "svg-btn";
         btn.type = "button";
         btn.textContent = "Download SVG";
-        // Closes over the element instead of looking it up by a timestamp id --
-        // those ids collided whenever two messages rendered in the same
-        // millisecond (i.e. every time a saved chat was reopened), so the
-        // button downloaded the wrong drawing.
         btn.addEventListener("click", () => {
             downloadBlob(new Blob([serializeSvg(svg)], { type: "image/svg+xml" }), "rhododendron_image.svg");
         });
@@ -236,16 +196,11 @@
     }
 
     function enhanceSvgs(container) {
-        // Raw SVG that Markdown already passed through: wrap it once, in place.
-        // (The old regex appended a *second* copy of every inline drawing.)
         container.querySelectorAll("svg").forEach((svg) => {
             if (svg.parentElement && svg.parentElement.classList.contains("svg-render")) return;
-            // Only wrap top-level drawings: pulling a nested <svg> out of its
-            // parent would break the image it belongs to.
             if (svg.parentElement && svg.parentElement.closest("svg")) return;
             wrapSvg(svg, null);
         });
-        // SVG inside a fenced code block: keep the source, render a preview below.
         container.querySelectorAll("pre > code").forEach((code) => {
             const src = code.textContent.trim();
             if (!/^<svg[\s>]/i.test(src) || !/<\/svg>$/i.test(src)) return;
@@ -254,7 +209,6 @@
         });
     }
 
-    // --------------------------------------------------------------- Rendering
     function appendBubble(sender) {
         const div = document.createElement("div");
         div.className = "message " + (sender === "user" ? "user-message" : "ai-message");
@@ -287,7 +241,6 @@
         return c.scrollHeight - c.scrollTop - c.clientHeight < 120;
     }
 
-    // ------------------------------------------------------------------ Modals
     function openModal(id) {
         const modal = document.getElementById(id);
         if (modal) modal.classList.add("open");
@@ -304,7 +257,6 @@
         return false;
     }
 
-    // ----------------------------------------------------------------- Sidebar
     function toggleSidebar(force) {
         const open = force === undefined ? !els.sidebar.classList.contains("open") : force;
         els.sidebar.classList.toggle("open", open);
@@ -317,7 +269,6 @@
     }
 
     function markActive(listEl, datasetKey, activeValue) {
-        // Update highlighting without re-reading the whole database.
         for (const btn of listEl.children) {
             btn.classList.toggle("active", (btn.dataset[datasetKey] || null) === activeValue);
         }
@@ -371,9 +322,7 @@
     }
 
     function updateHeaderTitle() {
-        // A badge rather than a "(Gem Active)" suffix: on a phone the longer
-        // title just truncated to nothing readable.
-        els.gemBadge.hidden = !state.activeGemId;
+        els.headerTitle.textContent = state.activeGemId ? "Rhododendron 2.0 (Gem Active)" : "Rhododendron 2.0";
     }
 
     function activateGem(id) {
@@ -389,35 +338,7 @@
         updateHeaderTitle();
     }
 
-    // ------------------------------------------------------------------- Chats
-    function isEmptyChat(chat) {
-        return !!chat && (!Array.isArray(chat.messages) || chat.messages.length === 0);
-    }
-
-    // Empty conversations are worthless to keep: every stray "+ New Chat" click
-    // used to leave another "New Chat" row in the sidebar forever.
-    async function pruneEmptyChats(keepId) {
-        const chats = await idbGetAll("chats");
-        const stale = chats.filter((c) => c.id !== keepId && isEmptyChat(c));
-        for (const c of stale) await idbDelete("chats", c.id);
-        return stale.length;
-    }
-
     async function startNewChat({ silent = false } = {}) {
-        // Reuse the current conversation while it's still empty rather than
-        // stacking up identical blank rows.
-        if (state.currentChatId) {
-            const current = await idbGet("chats", state.currentChatId).catch(() => null);
-            if (isEmptyChat(current)) {
-                if (!silent) {
-                    els.chatContainer.replaceChildren();
-                    closeSidebarOnMobile();
-                }
-                markActive(els.chatList, "chatId", state.currentChatId);
-                return state.currentChatId;
-            }
-        }
-
         const id = generateId();
         await idbPut("chats", { id, title: "New Chat", messages: [], timestamp: Date.now() });
         state.currentChatId = id;
@@ -434,7 +355,6 @@
         const chat = await idbGet("chats", id);
         state.currentChatId = id;
         writeSetting("lastChatId", id);
-        // Build off-screen and attach once instead of forcing a reflow per message.
         const frag = document.createDocumentFragment();
         const svgHosts = [];
         if (chat && Array.isArray(chat.messages)) {
@@ -457,7 +377,6 @@
         closeSidebarOnMobile();
     }
 
-    // -------------------------------------------------------------------- Gems
     async function saveGem() {
         const name = els.gemName.value.trim();
         const prompt = els.gemPrompt.value.trim();
@@ -466,7 +385,7 @@
         try {
             await idbPut("gems", { id: generateId(), name, systemPrompt: prompt });
         } catch (err) {
-            alert("Could not save the Gem: " + err.message);
+            console.error("Could not save the Gem:", err);
             return;
         }
         closeModal("gem-modal");
@@ -475,10 +394,9 @@
         await loadGemList();
     }
 
-    // --------------------------------------------------------- Export / Import
     async function exportData() {
         if (typeof JSZip === "undefined") {
-            alert("The export library failed to load. Check your internet connection and reload.");
+            console.error("The export library failed to load.");
             return;
         }
         try {
@@ -488,13 +406,13 @@
             const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
             downloadBlob(blob, "Rhododendron_Data.zip");
         } catch (err) {
-            alert("Export failed: " + err.message);
+            console.error("Export failed:", err);
         }
     }
 
     async function importData(file) {
         if (typeof JSZip === "undefined") {
-            alert("The import library failed to load. Check your internet connection and reload.");
+            console.error("The import library failed to load.");
             return;
         }
         try {
@@ -509,83 +427,42 @@
 
             await idbPutMany({ chats, gems });
             await loadSidebar();
-            alert("Imported " + chats.length + " chat(s) and " + gems.length + " gem(s).");
+            console.log("Imported " + chats.length + " chat(s) and " + gems.length + " gem(s).");
         } catch (err) {
-            alert("Import failed: " + err.message);
+            console.error("Import failed:", err);
         }
     }
+    // --- Multi-endpoint connection check ---
+    async function ensureModelReady(modelName) {
+        if (verifiedModels.has(modelName) && OLLAMA_URL) return true;
 
-    // ------------------------------------------------------------ Ollama checks
-    // Resolves to the tag listing from the first endpoint that answers, or null
-    // when every one of them is unreachable.
-    // Why each endpoint failed, so the dialog can say something more useful than
-    // "make sure Ollama is running" when that isn't the problem.
-    const endpointFailures = [];
+        let data;
+        let successUrl = null;
 
-    function describeFailure(base, err) {
-        if (err && err.name === "AbortError") return "no answer within " + (TAGS_TIMEOUT_MS / 1000) + "s";
-        if (err && /^HTTP \d/.test(err.message)) return err.message;
-        // fetch only ever reports "Failed to fetch" here, which covers refused,
-        // blocked-as-mixed-content and blocked-by-Private-Network-Access alike.
-        const local = /^http:\/\/(localhost|127\.0\.0\.1)/.test(base);
-        if (local && location.protocol === "https:") {
-            return "refused, or blocked because this page is served over HTTPS " +
-                   "and browsers restrict HTTPS pages from reaching http://localhost";
-        }
-        return "unreachable";
-    }
-
-    async function resolveEndpoint() {
-        const remembered = readSetting("endpoint", null);
-        const ordered = OLLAMA_ENDPOINTS.slice();
-        const seen = ordered.indexOf(remembered);
-        if (seen > 0) {
-            ordered.splice(seen, 1);
-            ordered.unshift(remembered);
-        }
-
-        endpointFailures.length = 0;
-        for (const base of ordered) {
+        for (const url of OLLAMA_ENDPOINTS) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), TAGS_TIMEOUT_MS);
             try {
-                const res = await fetch(base + "/api/tags", { signal: controller.signal });
-                if (!res.ok) throw new Error("HTTP " + res.status);
-                const data = await res.json();
-                // Verification is per endpoint: a model confirmed on localhost
-                // says nothing about what the tunnel has, so switching hosts
-                // has to re-check rather than trust the old answer.
-                if (OLLAMA_URL !== base) verifiedModels.clear();
-                OLLAMA_URL = base;
-                writeSetting("endpoint", base);
-                return data;
+                const res = await fetch(url + "/api/tags", { signal: controller.signal });
+                if (res.ok) {
+                    data = await res.json();
+                    successUrl = url;
+                    clearTimeout(timer);
+                    break;
+                }
             } catch (err) {
-                endpointFailures.push({ base: base, reason: describeFailure(base, err) });
+                // Silently try next endpoint
             } finally {
                 clearTimeout(timer);
             }
         }
-        OLLAMA_URL = null;
-        // A remembered endpoint that has stopped working must not be preferred
-        // forever, or every later load pays its timeout first.
-        writeSetting("endpoint", null);
-        return null;
-    }
 
-    async function ensureModelReady(modelName) {
-        if (OLLAMA_URL && verifiedModels.has(modelName)) return true;
-
-        const data = await resolveEndpoint();
-        if (!data) {
-            els.triedEndpoints.replaceChildren();
-            endpointFailures.forEach((f) => {
-                const li = document.createElement("li");
-                li.textContent = f.base + " — " + f.reason;
-                els.triedEndpoints.appendChild(li);
-            });
+        if (!successUrl) {
             openModal("cors-modal");
             return false;
         }
+
+        OLLAMA_URL = successUrl;
 
         const strip = (n) => String(n).replace(/:latest$/, "");
         const models = data && Array.isArray(data.models) ? data.models : [];
@@ -600,34 +477,41 @@
         return true;
     }
 
-    // ---------------------------------------------------------------- Messaging
-    // A Gem's instructions ride along as an ordinary user turn -- never as a
-    // `system` message. Ollama replaces the Modelfile's SYSTEM block whenever a
-    // request carries one, which would throw away Galla's own instructions and
-    // leave the Gem talking to a bare base model.
-    const GEM_PREAMBLE = "Additional instructions for this conversation, " +
-        "to follow alongside your existing ones:\n\n";
-    const GEM_ACK = "Understood. I'll follow those instructions from here on.";
-
-    async function resolveGemPrompt() {
-        if (!state.activeGemId) return "";
-        if (state.activeGemPrompt) return state.activeGemPrompt;
-        // The cache isn't populated yet if the Gem was picked a moment ago.
-        const gem = await idbGet("gems", state.activeGemId).catch(() => null);
-        state.activeGemPrompt = (gem && gem.systemPrompt) || "";
-        return state.activeGemPrompt;
-    }
-
-    function buildApiMessages(chat, gemPrompt) {
+    function buildApiMessages(chat) {
         const messages = [];
-        if (gemPrompt) {
-            messages.push({ role: "user", content: GEM_PREAMBLE + gemPrompt });
-            messages.push({ role: "assistant", content: GEM_ACK });
+        
+        // Define Galla's built-in memory and workspace commands
+        const gallaInstructions = `[SYSTEM]
+Commands: /memory /recall /edit /create /publish
+Use of commands:
+/memory - Update memory
+/recall - recall memory you have added before 
+/edit - edit files/folders
+/create - create files/folders
+/publish - zip every file in the workspace and publish it to a site (Output the published link formatted as domain.domain/?project=urlsafecharacters)\n\n`;
+
+        // Check if there are active Gem instructions
+        let gemInstruction = "";
+        if (state.activeGemId && state.activeGemPrompt) {
+            gemInstruction = `[Apply these custom instructions for this chat: ${state.activeGemPrompt}]\n\n`;
         }
+
         const history = chat.messages.slice(-MAX_CONTEXT_MESSAGES);
+        let firstUserFound = false;
+
         for (const m of history) {
-            messages.push({ role: m.sender === "user" ? "user" : "assistant", content: m.text });
+            let content = m.text;
+            
+            // Inject the system/memory prompt directly into the first user message 
+            // to ensure it doesn't override the primary Modelfile system prompt.
+            if (m.sender === "user" && !firstUserFound) {
+                content = gallaInstructions + gemInstruction + content;
+                firstUserFound = true;
+            }
+            
+            messages.push({ role: m.sender === "user" ? "user" : "assistant", content: content });
         }
+        
         return messages;
     }
 
@@ -644,7 +528,7 @@
             try {
                 const body = await res.json();
                 detail = body && body.error ? ": " + body.error : "";
-            } catch (err) { /* body wasn't JSON */ }
+            } catch (err) {}
             throw new Error("Ollama returned HTTP " + res.status + detail);
         }
 
@@ -663,28 +547,18 @@
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
-            try {
-                for (;;) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    buffer += decoder.decode(value, { stream: true });
-                    // Walk the buffer with an index instead of re-slicing it per
-                    // line, which rebuilt the whole string on every token.
-                    let start = 0;
-                    let idx;
-                    while ((idx = buffer.indexOf("\n", start)) !== -1) {
-                        consume(buffer.slice(start, idx));
-                        start = idx + 1;
-                    }
-                    buffer = buffer.slice(start);
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                let idx;
+                while ((idx = buffer.indexOf("\n")) !== -1) {
+                    consume(buffer.slice(0, idx));
+                    buffer = buffer.slice(idx + 1);
                 }
-                buffer += decoder.decode();
-                consume(buffer);
-            } finally {
-                // An error thrown out of consume() used to leave the response
-                // body open, holding the connection until GC caught up.
-                reader.cancel().catch(() => {});
             }
+            buffer += decoder.decode();
+            consume(buffer);
         } else {
             (await res.text()).split("\n").forEach(consume);
         }
@@ -692,14 +566,12 @@
     }
 
     function setSending(sending) {
+        state.sending = sending;
         els.sendBtn.textContent = sending ? "Stop" : "Send";
         els.sendBtn.classList.toggle("stop", sending);
-        els.sendBtn.setAttribute("aria-label", sending ? "Stop generating" : "Send message");
     }
 
     async function persistAiReply(chatId, text) {
-        // Re-read instead of reusing the copy captured before the request:
-        // the stored chat may have moved on while the model was generating.
         const fresh = (await idbGet("chats", chatId)) || null;
         if (!fresh) return;
         if (!Array.isArray(fresh.messages)) fresh.messages = [];
@@ -709,168 +581,96 @@
     }
 
     async function sendMessage() {
-        // The button doubles as "Stop" once a response is in flight.
-        if (state.controller) { state.controller.abort(); return; }
-        // Set synchronously: `sending` used to be set only after several awaits,
-        // so two quick clicks fired two requests for the same message.
-        if (state.busy) return;
+        if (state.sending) {
+            if (state.controller) state.controller.abort();
+            return;
+        }
 
         const text = els.input.value.trim();
         if (!text) return;
 
-        state.busy = true;
-        setSending(true);
+        try { await dbReady; } catch (err) {
+            console.error("Storage is unavailable, so chats can't be saved:", err);
+            return;
+        }
+
+        els.input.value = "";
+        const welcome = document.getElementById("welcome-message");
+        if (welcome) welcome.remove();
+
+        if (!state.currentChatId) await startNewChat({ silent: true });
+
+        let chat = await idbGet("chats", state.currentChatId);
+        if (!chat) chat = { id: state.currentChatId, title: "New Chat", messages: [], timestamp: Date.now() };
+        if (!Array.isArray(chat.messages)) chat.messages = [];
+
+        const isFirstMessage = chat.messages.length === 0;
+        if (isFirstMessage) chat.title = makeTitle(text);
+        chat.messages.push({ sender: "user", text });
+        chat.timestamp = Date.now();
+        await idbPut("chats", chat);
+
+        renderMessage("user", text);
+        if (isFirstMessage) await loadChatList();
 
         const model = els.model.value;
-        let chatId = null;
-        let bubble = null;
+        const bubble = appendBubble("ai");
+        bubble.textContent = "Thinking…";
+
+        setSending(true);
+        const controller = new AbortController();
+        state.controller = controller;
+
         let full = "";
-
         try {
-            try { await dbReady; } catch (err) {
-                alert("Storage is unavailable, so chats can't be saved: " + err.message);
-                return;
-            }
-
-            // Check the connection and the model BEFORE the message is cleared
-            // from the box and written to the chat. Doing it last meant a failed
-            // check threw away what you had typed and left a user turn with no
-            // reply in the history, replayed as context on every later send.
-            if (!(await ensureModelReady(model))) return;
-
-            els.input.value = "";
-            const welcome = document.getElementById("welcome-message");
-            if (welcome) welcome.remove();
-
-            // startNewChat is asynchronous -- the old code fired it and immediately
-            // read back a chat that didn't exist yet, dropping the first message.
-            if (!state.currentChatId) await startNewChat({ silent: true });
-            // Pin the target: the user can open a different chat mid-stream, and
-            // the reply must land in the conversation it was asked in.
-            chatId = state.currentChatId;
-
-            let chat = await idbGet("chats", chatId);
-            if (!chat) chat = { id: chatId, title: "New Chat", messages: [], timestamp: Date.now() };
-            if (!Array.isArray(chat.messages)) chat.messages = [];
-
-            const isFirstMessage = chat.messages.length === 0;
-            if (isFirstMessage) chat.title = makeTitle(text);
-            chat.messages.push({ sender: "user", text });
-            chat.timestamp = Date.now();
-            await idbPut("chats", chat);
-
-            renderMessage("user", text);
-            // Only rebuild the list when the title actually changed.
-            if (isFirstMessage) await loadChatList();
-
-            const gemPrompt = await resolveGemPrompt();
-            bubble = appendBubble("ai");
-            bubble.textContent = "Thinking…";
-            // Once the user navigates away this bubble is detached; skip the paints.
-            const onScreen = () => state.currentChatId === chatId && bubble.isConnected;
-
-            const controller = new AbortController();
-            state.controller = controller;
+            if (!(await ensureModelReady(model))) { bubble.remove(); return; }
 
             let lastPaint = 0;
             await streamChat({
                 model,
-                messages: buildApiMessages(chat, gemPrompt),
+                messages: buildApiMessages(chat),
                 signal: controller.signal,
                 onDelta: (acc) => {
                     full = acc;
-                    if (!onScreen()) return;
-                    // Re-parsing Markdown costs more as the reply grows, so back
-                    // the repaint rate off instead of doing it 16x a second.
-                    const wait = Math.min(STREAM_PAINT_MAX_MS, STREAM_PAINT_MS + full.length / 40);
                     const now = Date.now();
-                    if (now - lastPaint < wait) return;
+                    if (now - lastPaint < STREAM_PAINT_MS) return;
                     lastPaint = now;
                     const stick = isNearBottom();
-                    // SVG wrapping is skipped mid-stream: the markup is still partial.
                     fillBubble(bubble, "ai", full, { withSvg: false });
                     bubble.appendChild(Object.assign(document.createElement("span"), {
-                        className: "typing-cursor", textContent: "\u258D"
+                        className: "typing-cursor", textContent: "▍"
                     }));
                     if (stick) scrollToBottom();
                 }
             });
 
-            if (onScreen()) {
-                fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
-                scrollToBottom();
-            }
-            if (full.trim()) await persistAiReply(chatId, full);
+            fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
+            scrollToBottom();
+            if (full.trim()) await persistAiReply(state.currentChatId, full);
         } catch (err) {
             if (err.name === "AbortError") {
                 if (full.trim()) {
-                    if (bubble && bubble.isConnected) fillBubble(bubble, "ai", full);
-                    if (chatId) await persistAiReply(chatId, full);
-                } else if (bubble) {
+                    fillBubble(bubble, "ai", full);
+                    await persistAiReply(state.currentChatId, full);
+                } else {
                     bubble.remove();
                 }
-            } else if (bubble) {
+            } else {
                 bubble.classList.add("error-message");
                 bubble.textContent = "Error: " + err.message +
-                    " \u2014 make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
-                // The endpoint may have gone away (a tunnel dropping, Ollama
-                // being stopped), so re-probe from scratch on the next send.
+                    " — make sure Ollama is running with OLLAMA_ORIGINS=\"*\".";
+                
+                // Reset verified state and force a re-check of endpoints if connection drops mid-chat
                 verifiedModels.delete(model);
-                OLLAMA_URL = null;
-            } else {
-                alert("Something went wrong: " + err.message);
+                OLLAMA_URL = null; 
             }
         } finally {
             state.controller = null;
-            state.busy = false;
             setSending(false);
-            // Refocusing on a phone pops the keyboard back up over the answer.
-            if (window.innerWidth > 768) els.input.focus();
+            els.input.focus();
         }
     }
 
-    // ---------------------------------------------------------------- Viewport
-    // Chrome honours interactive-widget=resizes-content, but Safari and older
-    // Android browsers leave the layout at full height and let the keyboard
-    // cover the composer. Measure the visual viewport and pin the app to it
-    // while the keyboard is up. The threshold keeps the collapsing URL bar
-    // (a much smaller delta) from resizing the layout on every scroll.
-    const KEYBOARD_MIN_DELTA = 120;
-
-    function syncViewportHeight() {
-        const vv = window.visualViewport;
-        if (!vv) return;
-        const keyboardOpen = window.innerHeight - vv.height > KEYBOARD_MIN_DELTA;
-        if (keyboardOpen) {
-            document.documentElement.style.setProperty("--app-height", vv.height + "px");
-            document.body.classList.add("keyboard-open");
-        } else {
-            document.documentElement.style.removeProperty("--app-height");
-            document.body.classList.remove("keyboard-open");
-        }
-    }
-
-    function watchViewport() {
-        const vv = window.visualViewport;
-        if (!vv) return;
-        let queued = false;
-        const onChange = () => {
-            if (queued) return;
-            queued = true;
-            requestAnimationFrame(() => {
-                queued = false;
-                const stick = isNearBottom();
-                syncViewportHeight();
-                // Keep the newest message in view as the keyboard opens.
-                if (stick) scrollToBottom();
-            });
-        };
-        vv.addEventListener("resize", onChange);
-        vv.addEventListener("scroll", onChange);
-        syncViewportHeight();
-    }
-
-    // -------------------------------------------------------------------- Init
     function cacheElements() {
         const ids = {
             sidebar: "sidebar", overlay: "sidebar-overlay", menuBtn: "menu-btn",
@@ -878,8 +678,7 @@
             headerTitle: "header-title", model: "model-select", input: "user-input",
             sendBtn: "send-btn", gemName: "gem-name", gemPrompt: "gem-prompt",
             importFile: "import-file", missingModelName: "missing-model-name",
-            pullCommand: "pull-command", triedEndpoints: "tried-endpoints",
-            gemBadge: "gem-badge", sidebarClose: "sidebar-close"
+            pullCommand: "pull-command"
         };
         for (const key in ids) els[key] = document.getElementById(ids[key]);
     }
@@ -887,9 +686,8 @@
     function bindEvents() {
         els.menuBtn.addEventListener("click", () => toggleSidebar());
         els.overlay.addEventListener("click", () => toggleSidebar(false));
-        els.sidebarClose.addEventListener("click", () => toggleSidebar(false));
         document.getElementById("new-chat-btn").addEventListener("click", () => {
-            startNewChat().catch((err) => alert("Could not start a chat: " + err.message));
+            startNewChat().catch((err) => console.error("Could not start a chat:", err));
         });
         document.getElementById("create-gem-btn").addEventListener("click", () => {
             openModal("gem-modal");
@@ -903,14 +701,12 @@
             const file = e.target.files && e.target.files[0];
             if (!file) return;
             await importData(file);
-            // Reset so picking the same file again still fires "change".
             e.target.value = "";
         });
 
-        // Delegated: the sidebar lists are rebuilt constantly.
         els.chatList.addEventListener("click", (e) => {
             const btn = e.target.closest("button[data-chat-id]");
-            if (btn) loadChat(btn.dataset.chatId).catch((err) => alert("Could not open chat: " + err.message));
+            if (btn) loadChat(btn.dataset.chatId).catch((err) => console.error("Could not open chat:", err));
         });
         els.gemList.addEventListener("click", (e) => {
             const btn = e.target.closest("button");
@@ -919,7 +715,6 @@
 
         els.sendBtn.addEventListener("click", () => { sendMessage(); });
         els.input.addEventListener("keydown", (e) => {
-            // keypress is deprecated, and isComposing guards IME input.
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
                 e.preventDefault();
                 sendMessage();
@@ -943,7 +738,6 @@
     async function init() {
         cacheElements();
         bindEvents();
-        watchViewport();
 
         const savedModel = readSetting("model", null);
         if (savedModel && els.model.querySelector('option[value="' + CSS.escape(savedModel) + '"]')) {
@@ -959,11 +753,9 @@
         }
 
         state.activeGemId = readSetting("activeGemId", null) || null;
-
-        const lastChatId = readSetting("lastChatId", null);
-        await pruneEmptyChats(lastChatId).catch(() => {});
         await loadSidebar();
 
+        const lastChatId = readSetting("lastChatId", null);
         if (lastChatId && (await idbGet("chats", lastChatId))) await loadChat(lastChatId);
     }
 
