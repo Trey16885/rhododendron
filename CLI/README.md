@@ -138,15 +138,35 @@ is a workspace, not the same conversation.
 
 ### The token
 
-`galla auth` asks for a GitHub personal access token — make one at
-<https://github.com/settings/tokens/new> with the **repo** scope.
+`galla auth` asks for a GitHub **fine-grained** personal access token — make one
+at <https://github.com/settings/personal-access-tokens/new>.
+
+**Repository access: All repositories.** One limited to selected repositories
+can't create a new repo, and wouldn't cover a repo you make tomorrow.
+
+**Repository permissions:**
+
+| | | |
+|---|---|---|
+| Contents | Read and write | push your files |
+| Administration | Read and write | create the repository |
+| Pages | Read and write | switch the site on |
+| Metadata | Read-only | ticked for you already |
+
+Add Workflows if you want Actions later.
+
+Fine-grained tokens expire. When yours does, everything starts refusing you —
+run `galla auth` again with a new one.
+
+A classic token with the `repo` scope still works; `galla auth` says so and
+carries on. The permissions above just aren't how it's described.
 
 There are three ways to give it, so an awkward terminal is never a dead end:
 
 ```sh
-galla auth                      # prompts; each character shows as a dot
-galla auth ghp_your_token       # pass it straight in
-GALLA_TOKEN=ghp_your_token galla auth
+galla auth                              # prompts; each character shows as a dot
+galla auth github_pat_your_token        # pass it straight in
+GALLA_TOKEN=github_pat_your_token galla auth
 ```
 
 At the prompt the token is masked, not invisible: you will see a dot per
@@ -158,11 +178,18 @@ saved until you replace it by running `galla auth` again. It is deliberately
 never written into a project's git remote: `.git/config` is world-readable and
 travels with the folder.
 
+**GitHub can't tell you what a fine-grained token is allowed to do** — it
+reports permissions nowhere, only refusals at the point of use. So `galla auth`
+can't check the ticks for you; instead each refusal names the permission that
+was missing. `galla link` says Administration, `galla publish` says Contents or
+Pages.
+
 ### Publishing
 
 `galla publish` commits everything, pushes to `main`, and tries to switch on
-GitHub Pages for you. If your token can't do that (fine-grained tokens often
-can't), it prints the four steps to do it once by hand:
+GitHub Pages for you. If your token can't do that — **Pages: Read and write** is
+the tick people most often leave off — it prints the four steps to do it once by
+hand:
 
 1. Open `https://github.com/<owner>/<repo>/settings/pages`
 2. Under **Build and deployment**, set Source to **Deploy from a branch**
