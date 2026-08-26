@@ -21,7 +21,7 @@ done
 # written into a git remote: .git/config is world-readable and gets copied
 # around with the project.
 load_config() {
-    GALLA_PAT=""; GALLA_USER=""
+    GALLA_PAT=""; GALLA_USER=""; GALLA_CONNECT_TOKEN=""
     # Must not end on a failed test: under `set -e` a function returning
     # non-zero takes the whole script down, which on a first run (no config
     # yet) killed every command before it printed anything.
@@ -35,6 +35,9 @@ save_config() {
     {
         printf 'GALLA_PAT=%s\n' "$(printf '%q' "$GALLA_PAT")"
         printf 'GALLA_USER=%s\n' "$(printf '%q' "$GALLA_USER")"
+        # Persisted too, or pairing would break every time the connector
+        # restarted with a freshly generated token.
+        printf 'GALLA_CONNECT_TOKEN=%s\n' "$(printf '%q' "${GALLA_CONNECT_TOKEN:-}")"
     } > "$CONFIG"
     chmod 600 "$CONFIG"
 }
@@ -363,6 +366,317 @@ cmd_publish() {
     say "From now on 'galla publish $name' updates the site in about a minute."
 }
 
+# ------------------------------------------------------------------- chat
+# Chat needs Ollama, not GitHub, so it works with no token saved.
+CHAT_ENDPOINTS="${GALLA_OLLAMA:-http://localhost:11434 https://ollama-tunnel.serveousercontent.com}"
+CHAT_MODEL="${GALLA_MODEL:-treyleo16/gpt-5-6-sol}"
+
+# Text -> the inside of a JSON string.
+json_escape() {
+    printf '%s' "$1" | awk '
+        BEGIN { ORS = "" }
+        {
+            line = $0
+            gsub(/\\/, "\\\\", line)
+            gsub(/"/,  "\\\"", line)
+            gsub(/\t/, "\\t",  line)
+            if (NR > 1) print "\\n"
+            print line
+        }'
+}
+
+# NDJSON lines -> the text they carry. Ollama escapes < > & as < and
+# friends, which is most of an HTML file, so those have to come back.
+ndjson_text() {
+    awk '
+        function uchar(code) {
+            if (code == "003c") return "<"
+            if (code == "003e") return ">"
+            if (code == "0026") return "&"
+            if (code == "0027") return "\x27"
+            if (code == "0022") return "\""
+            return ""
+        }
+        function unesc(s,   out, i, c, n, code) {
+            out = ""; i = 1; n = length(s)
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (c == "\\") {
+                    i++; c = substr(s, i, 1)
+                    if (c == "n")      out = out "\n"
+                    else if (c == "t") out = out "\t"
+                    else if (c == "r") { }
+                    else if (c == "u") { code = substr(s, i + 1, 4); i += 4; out = out uchar(code) }
+                    else out = out c
+                } else out = out c
+                i++
+            }
+            return out
+        }
+        {
+            if (!match($0, /"content":"/)) next
+            rest = substr($0, RSTART + 11)
+            out = ""; i = 1
+            while (i <= length(rest)) {
+                ch = substr(rest, i, 1)
+                if (ch == "\\") { out = out ch substr(rest, i + 1, 1); i += 2; continue }
+                if (ch == "\"") break
+                out = out ch; i++
+            }
+            printf "%s", unesc(out)
+            fflush()
+        }'
+}
+
+chat_endpoint() {
+    local base
+    for base in $CHAT_ENDPOINTS; do
+        if curl -fsS --max-time 4 "$base/api/tags" >/dev/null 2>&1; then
+            printf '%s' "$base"; return 0
+        fi
+    done
+    return 1
+}
+
+# The project's files, so Galla can see what it is editing. Bounded, because
+# everything here is re-sent with the request.
+project_context() {
+    local dir="$1" f rel size total=0
+    while IFS= read -r f; do
+        rel="${f#"$dir"/}"
+        size=$(wc -c < "$f")
+        [ "$size" -gt 20000 ] && continue
+        grep -Iq . "$f" 2>/dev/null || continue     # text only
+        total=$((total + size))
+        [ "$total" -gt 60000 ] && break
+        printf '\n--- %s ---\n' "$rel"
+        cat "$f"
+    done < <(find "$dir" -type f -not -path '*/.git/*' -not -path '*/.galla/*' | sort)
+}
+
+CHAT_BRIEF='You are Galla, working in a project folder on the user'"'"'s machine.
+To create or change a file, write a fenced code block whose opening line is the
+file path and nothing else:
+
+```index.html
+<!DOCTYPE html>
+...
+```
+
+That block is written to that path exactly as given, so output the whole file,
+never a fragment or a diff. Outside the blocks, say briefly what you changed.
+If nothing needs writing, just answer.'
+
+# Pull ```path ... ``` blocks out of a reply and write them.
+write_files() {
+    local dir="$1" reply="$2" wrote=0 path dest ans nf body
+    local tmp; tmp="$(mktemp -d)"
+
+    printf '%s' "$reply" | awk -v out="$tmp" '
+        /^[ \t]*```/ {
+            if (inblock) { inblock = 0; close(target); next }
+            info = $0
+            sub(/^[ \t]*```/, "", info)
+            gsub(/^[ \t]+|[ \t]+$/, "", info)
+            # a path, not a language tag: contains a dot, no spaces
+            if (info ~ /\./ && info !~ /[ \t]/) {
+                n++; target = out "/" n
+                printf "%s", info > (target ".name"); close(target ".name")
+                inblock = 1
+            }
+            next
+        }
+        inblock { print > target }
+    '
+
+    for nf in "$tmp"/*.name; do
+        [ -e "$nf" ] || continue
+        path="$(cat "$nf")"
+        body="${nf%.name}"
+        [ -e "$body" ] || continue
+        case "$path" in
+            /*|*..*) warn "  refused $path - it points outside the project"; continue ;;
+        esac
+        dest="$dir/$path"
+        if [ -e "$dest" ]; then
+            # New files are written freely; anything that already exists is
+            # your work until you say otherwise. The answer has to come from the
+            # terminal, since the chat loop is already reading stdin -- and with
+            # no terminal at all the answer is no.
+            ans=""
+            if [ -r /dev/tty ]; then
+                printf '  overwrite %s? [y/N] ' "$path"
+                read -r ans < /dev/tty 2>/dev/null || ans=""
+            fi
+            case "$ans" in
+                [yY]*) ;;
+                *) say "  kept $path as it was"; continue ;;
+            esac
+        fi
+        mkdir -p "$(dirname "$dest")"
+        cp "$body" "$dest"
+        say "  wrote $path"
+        wrote=$((wrote + 1))
+    done
+
+    rm -rf "$tmp"
+    [ "$wrote" -gt 0 ] && say ""
+    return 0
+}
+
+cmd_chat() {
+    local name="${1:-}" dir
+    if [ -n "$name" ]; then
+        dir="$(require_project "$name")"
+    elif [ -d "$PWD/.galla" ]; then
+        dir="$PWD"; name="$(basename "$PWD")"
+    else
+        fail "usage: galla chat <project>   (or run it inside a project folder)"
+    fi
+
+    local base
+    base="$(chat_endpoint)" ||
+        fail "can't reach Ollama. Start it with:  OLLAMA_ORIGINS=\"*\" ollama serve"
+
+    say "Galla is in $name   ($CHAT_MODEL)"
+    say "Ask for what you want built. /files lists them, /publish ships it, /exit leaves."
+    say ""
+
+    local history="" line reply msgs context
+    while :; do
+        printf 'you   > '
+        IFS= read -r line || { say ""; break; }
+        case "$line" in
+            "")            continue ;;
+            /exit|/quit|q) break ;;
+            /files)        (cd "$dir" && find . -type f -not -path './.git/*' -not -path './.galla/*' | sed 's|^\./|  |'); say ""; continue ;;
+            /publish)      cmd_publish "$name" || true; continue ;;
+        esac
+
+        if [ -z "$history" ]; then
+            # The brief and the current files ride in the first turn, the same
+            # shape the chat app uses, so no system message is needed and the
+            # Modelfile's own SYSTEM block survives.
+            context="$(project_context "$dir")"
+            msgs="{\"role\":\"user\",\"content\":\"$(json_escape "$CHAT_BRIEF
+
+Files in the project right now:$context
+
+$line")\"}"
+        else
+            msgs="$history,{\"role\":\"user\",\"content\":\"$(json_escape "$line")\"}"
+        fi
+
+        printf 'Galla > '
+        reply="$(curl -sS --no-buffer -X POST "$base/api/chat" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$CHAT_MODEL\",\"messages\":[$msgs],\"stream\":true}" \
+            2>/dev/null | ndjson_text | tee /dev/stderr)"
+        say ""
+
+        if [ -z "$reply" ]; then
+            warn "no reply - is $CHAT_MODEL pulled?  ollama pull $CHAT_MODEL"
+            continue
+        fi
+
+        history="$msgs,{\"role\":\"assistant\",\"content\":\"$(json_escape "$reply")\"}"
+        write_files "$dir" "$reply"
+    done
+    say "Left $name."
+}
+
+# -------------------------------------------------------------- connector
+CONNECTOR="${GALLA_CONNECTOR:-$CONFIG_DIR/connector.py}"
+CONNECT_PORT=4316
+
+# The token is what stops the fixed port being enough on its own: anything else
+# on this machine can reach 4316, so reaching it must not be sufficient.
+connect_token() {
+    load_config
+    if [ -z "${GALLA_CONNECT_TOKEN:-}" ]; then
+        GALLA_CONNECT_TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        save_config
+    fi
+    printf '%s' "$GALLA_CONNECT_TOKEN"
+}
+
+cmd_connect() {
+    command -v python3 >/dev/null 2>&1 || fail \
+"python3 is needed to run the connector.
+  Termux:  pkg install -y python
+  Debian:  sudo apt install -y python3
+  macOS:   brew install python"
+
+    [ -f "$CONNECTOR" ] || fail "connector is missing from $CONNECTOR. Run 'galla update'."
+
+    local token; token="$(connect_token)"
+    say "Galla CLI connector"
+    say ""
+    say "  Port:      $CONNECT_PORT (loopback only)"
+    say "  Projects:  $WORKSPACE"
+    say ""
+    say "In the chat app, open Connectors and pair Galla CLI with this token:"
+    say ""
+    say "    $token"
+    say ""
+    say "Leave this running while you work. Ctrl-C disconnects."
+    say ""
+
+    GALLA_CONNECT_TOKEN="$token" \
+    GALLA_HOME="$WORKSPACE" \
+    GALLA_BIN="$(command -v galla 2>/dev/null || printf 'galla')" \
+    exec python3 "$CONNECTOR"
+}
+
+cmd_token() {
+    say "$(connect_token)"
+}
+
+# ----------------------------------------------------------------- update
+cmd_update() {
+    local src="${GALLA_SOURCE:-https://raw.githubusercontent.com/Trey16885/rhododendron/main/CLI}"
+    local target; target="$(command -v galla 2>/dev/null || printf '%s' "${GALLA_BIN_DIR:-$HOME/.local/bin}/galla")"
+    [ -w "$(dirname "$target")" ] || fail "can't write to $(dirname "$target")."
+
+    say "Fetching the latest galla ..."
+    local tmp; tmp="$(mktemp)"
+    if ! curl -fsSL "$src/galla" -o "$tmp"; then
+        rm -f "$tmp"; fail "download failed. Check your connection, or $src"
+    fi
+
+    # Do not trust the download. Files in this project have arrived truncated
+    # before, and replacing a working CLI with half a script would leave no way
+    # to update back out of it.
+    if ! head -n1 "$tmp" | grep -q '^#!'; then
+        rm -f "$tmp"; fail "that wasn't a script (is the URL right?). Nothing changed."
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; fail "the downloaded script is incomplete or broken. Nothing changed."
+    fi
+
+    local newver; newver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
+    if [ "$newver" = "$VERSION" ]; then
+        rm -f "$tmp"; say "Already on $VERSION."; return 0
+    fi
+
+    chmod +x "$tmp"
+    mv "$tmp" "$target"
+
+    # The connector ships with the CLI and has to move with it.
+    local ctmp; ctmp="$(mktemp)"
+    if curl -fsSL "$src/connector.py" -o "$ctmp" 2>/dev/null &&
+       head -n1 "$ctmp" | grep -q '^#!' &&
+       python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ctmp" 2>/dev/null; then
+        mkdir -p "$CONFIG_DIR"
+        mv "$ctmp" "$CONNECTOR"
+    else
+        rm -f "$ctmp"
+        warn "  (the connector could not be updated; the CLI itself was)"
+    fi
+
+    say "Updated $VERSION -> ${newver:-unknown}  ($target)"
+}
+
 cmd_help() {
     cat <<EOF
 galla $VERSION - make things and put them on the web.
@@ -375,6 +689,11 @@ galla $VERSION - make things and put them on the web.
   galla whoami                  show who you are signed in as
   galla link <name> [owner/repo]  attach a repository (or create one)
   galla publish <name> [message]  commit, push, and put it on GitHub Pages
+
+  galla chat [name]             talk to Galla; it writes files in the project
+  galla connect                 let the chat app work with these projects
+  galla token                   show the pairing token again
+  galla update                  fetch the latest galla
 
 Projects live in $WORKSPACE
 Token lives in $CONFIG (readable only by you)
@@ -391,6 +710,10 @@ main() {
         whoami)   cmd_whoami "$@" ;;
         link)     cmd_link "$@" ;;
         publish)  cmd_publish "$@" ;;
+        chat)     cmd_chat "$@" ;;
+        connect)  cmd_connect "$@" ;;
+        token)    cmd_token "$@" ;;
+        update|upgrade) cmd_update "$@" ;;
         help|-h|--help) cmd_help ;;
         version|-v|--version) say "galla $VERSION" ;;
         *) warn "galla: '$cmd' isn't a command."; say ""; cmd_help; exit 1 ;;

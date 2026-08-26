@@ -44,6 +44,12 @@
             <div id="gem-list"></div>
         </div>
 
+        <div class="sidebar-section">
+            <div class="sidebar-title">Connectors</div>
+            <div id="connector-list"></div>
+            <button class="sidebar-btn" id="add-connector-btn" style="border-style: dashed;">+ Add Connector</button>
+        </div>
+
         <div class="sidebar-section" style="margin-top: auto;">
             <div class="sidebar-title">Data Management</div>
             <button class="sidebar-btn" id="export-btn">📦 Export to ZIP</button>
@@ -87,6 +93,19 @@
             <textarea id="gem-prompt" class="field" rows="5" placeholder="System instructions (e.g. You are a Python expert. Only reply in code.)"></textarea>
             <button class="modal-btn" id="save-gem-btn">Save Gem</button>
             <button class="modal-btn secondary" data-close="gem-modal">Cancel</button>
+        </div>
+    </div>
+
+    <!-- Connector Modal -->
+    <div id="connector-modal" class="modal">
+        <div class="modal-content" role="dialog" aria-modal="true" aria-label="Connector">
+            <h2 id="connector-modal-title">Connector</h2>
+            <p id="connector-modal-note" style="margin: 0; color: var(--text-muted); font-size: 0.9rem;"></p>
+            <input type="text" class="field" id="connector-name" placeholder="Name (e.g. My Notes)">
+            <input type="text" class="field" id="connector-url" placeholder="http://localhost:4317" autocomplete="off">
+            <input type="text" class="field" id="connector-token" placeholder="Pairing token" autocomplete="off">
+            <button class="modal-btn" id="connector-save-btn">Connect</button>
+            <button class="modal-btn secondary" data-close="connector-modal">Cancel</button>
         </div>
     </div>
 

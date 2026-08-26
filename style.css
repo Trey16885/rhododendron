@@ -310,6 +310,54 @@ button.send-btn.stop { background-color: var(--error); }
 textarea.field { resize: vertical; }
 /* App output (command results): deliberately unlike a chat bubble, because it
    is the app talking, not the model. */
+/* Connectors */
+.connector-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    margin-bottom: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    background: transparent;
+    color: var(--text-main);
+    font-family: inherit;
+    font-size: 0.95rem;
+    cursor: pointer;
+    text-align: left;
+}
+.connector-row:hover { background-color: var(--hover); }
+.connector-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: #64748b;
+    flex-shrink: 0;
+}
+.connector-dot.on      { background: #10b981; }
+.connector-dot.found   { background: #f59e0b; }
+.connector-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.connector-state { color: var(--text-muted); font-size: 0.8rem; flex-shrink: 0; }
+.connector-remove {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.1rem;
+    line-height: 1;
+    padding: 0 0.15rem;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.connector-remove:hover { color: var(--error); }
+.connector-locked { color: var(--text-muted); font-size: 0.8rem; flex-shrink: 0; }
+
 .note-message {
     align-self: center;
     max-width: 92%;

@@ -28,7 +28,65 @@ galla open my-site          # resume it - opens a shell in the folder
 galla link my-site          # pick a repo, or make a new one
 galla publish my-site       # commit, push, and put it on GitHub Pages
 galla list                  # what you have
+
+galla chat my-site          # talk to Galla; it writes the files
+galla update                # fetch the latest galla
 ```
+
+## Connectors
+
+`galla connect` lets the chat app in your browser work with these projects.
+
+```sh
+galla connect
+```
+
+It prints a pairing token and holds the terminal. In the chat app, open
+**Connectors**, click **Galla CLI**, paste the token. Then `/create`, `/edit`
+and `/publish` in the chat act on real files.
+
+Galla CLI is built in: always port **4316**, and it can't be renamed, re-pointed
+or removed — the point of it is being one address that is always what it says it
+is. You can add your own connectors alongside it, and those you can remove.
+
+**The token is what makes the fixed port safe.** Anything else on your machine
+can reach 4316, so reaching it must not be enough. The connector also listens on
+loopback only (nothing on your network can see it), refuses any origin other
+than the chat app, refuses requests that aren't `application/json` — that's the
+kind that would skip the browser's preflight — and refuses paths that point
+outside a project.
+
+`galla token` prints the token again. It needs `python3`
+(`pkg install -y python` on Termux).
+
+## Talking to Galla
+
+```sh
+galla chat my-site          # or just `galla chat` inside the folder
+```
+
+Galla sees the project's files and writes what you ask for:
+
+```
+you   > make the heading blue and add an about page
+Galla > Updated the heading colour and added a second page.
+  wrote index.html
+  wrote about.html
+you   > /publish
+```
+
+Inside the chat: `/files` lists them, `/publish` ships the project, `/exit` leaves.
+
+**New files are written straight away. Anything that already exists asks first**
+— that file is your work until you say otherwise. A path pointing outside the
+project is refused.
+
+This needs Ollama running (`OLLAMA_ORIGINS="*" ollama serve`), but no GitHub
+token — chatting and publishing are separate. Set `GALLA_MODEL` to use a model
+other than the default.
+
+Memories from the chat app do not carry over: those live in the browser. This
+is a workspace, not the same conversation.
 
 ### The token
 
