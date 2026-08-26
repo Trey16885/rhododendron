@@ -308,6 +308,22 @@ button.send-btn.stop { background-color: var(--error); }
     color: white; border: 1px solid #475569; font-family: inherit; font-size: 1rem;
 }
 textarea.field { resize: vertical; }
+/* App output (command results): deliberately unlike a chat bubble, because it
+   is the app talking, not the model. */
+.note-message {
+    align-self: center;
+    max-width: 92%;
+    padding: 0.6rem 0.9rem;
+    border: 1px dashed var(--border);
+    border-radius: 0.5rem;
+    background: rgba(148, 163, 184, 0.08);
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .tried-list {
     margin: 0;
     padding-left: 1.25rem;
