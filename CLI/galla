@@ -95,6 +95,27 @@ ensure_gitignore() {
     fi
 }
 
+# Reads a secret showing a dot per character. `read -s` shows nothing at all,
+# which on a phone is indistinguishable from a frozen prompt -- you cannot tell
+# whether a paste registered, so it looks broken.
+read_masked() {
+    local ch secret=""
+    while IFS= read -r -s -n 1 ch; do
+        [ -z "$ch" ] && break                       # Enter ends it
+        case "$ch" in
+            $'\177'|$'\b')                          # backspace
+                if [ -n "$secret" ]; then
+                    secret="${secret%?}"
+                    printf '\b \b' >&2
+                fi
+                ;;
+            *) secret="$secret$ch"; printf '.' >&2 ;;
+        esac
+    done
+    printf '\n' >&2
+    printf '%s' "$secret"
+}
+
 # ------------------------------------------------------------------- auth
 cmd_auth() {
     load_config
@@ -109,10 +130,32 @@ cmd_auth() {
         say ""
     fi
 
-    printf 'Paste your token (input hidden): '
-    local token=""
-    if [ -t 0 ]; then read -rs token; say ""; else read -r token; fi
-    [ -n "$token" ] || fail "no token entered, nothing changed."
+    # Three ways in, so a terminal that will not cooperate is never a dead end:
+    #   galla auth ghp_xxx        argument
+    #   GALLA_TOKEN=ghp_xxx galla auth   environment
+    #   the prompt below           typed or pasted
+    local token="${1:-${GALLA_TOKEN:-}}"
+
+    if [ -z "$token" ]; then
+        if [ -t 0 ]; then
+            printf 'Paste your token, then press Enter: '
+            token="$(read_masked)"
+        else
+            read -r token || true
+        fi
+    fi
+
+    if [ -z "$token" ]; then
+        say ""
+        say "No token received."
+        say ""
+        say "If pasting into the prompt does not work on your terminal, pass it"
+        say "directly instead:"
+        say ""
+        say "    galla auth ghp_your_token_here"
+        say ""
+        exit 1
+    fi
 
     GALLA_PAT="$token"
     local body login
@@ -328,7 +371,7 @@ galla $VERSION - make things and put them on the web.
   galla list                    show your projects
   galla open <name>             resume one (opens a shell in it)
 
-  galla auth                    save or replace your GitHub token
+  galla auth [token]            save or replace your GitHub token
   galla whoami                  show who you are signed in as
   galla link <name> [owner/repo]  attach a repository (or create one)
   galla publish <name> [message]  commit, push, and put it on GitHub Pages
