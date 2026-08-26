@@ -21,7 +21,7 @@ done
 # written into a git remote: .git/config is world-readable and gets copied
 # around with the project.
 load_config() {
-    GALLA_PAT=""; GALLA_USER=""; GALLA_CONNECT_TOKEN=""
+    GALLA_PAT=""; GALLA_USER=""; GALLA_CONNECT_TOKEN=""; GALLA_SAVED_MODEL=""
     # Must not end on a failed test: under `set -e` a function returning
     # non-zero takes the whole script down, which on a first run (no config
     # yet) killed every command before it printed anything.
@@ -35,6 +35,7 @@ save_config() {
     {
         printf 'GALLA_PAT=%s\n' "$(printf '%q' "$GALLA_PAT")"
         printf 'GALLA_USER=%s\n' "$(printf '%q' "$GALLA_USER")"
+        printf 'GALLA_SAVED_MODEL=%s\n' "$(printf '%q' "${GALLA_SAVED_MODEL:-}")"
         # Persisted too, or pairing would break every time the connector
         # restarted with a freshly generated token.
         printf 'GALLA_CONNECT_TOKEN=%s\n' "$(printf '%q' "${GALLA_CONNECT_TOKEN:-}")"
@@ -369,7 +370,70 @@ cmd_publish() {
 # ------------------------------------------------------------------- chat
 # Chat needs Ollama, not GitHub, so it works with no token saved.
 CHAT_ENDPOINTS="${GALLA_OLLAMA:-http://localhost:11434 https://ollama-tunnel.serveousercontent.com}"
-CHAT_MODEL="${GALLA_MODEL:-treyleo16/gpt-5-6-sol}"
+DEFAULT_MODEL="treyleo16/gpt-5-6-sol"
+
+# Which model to talk to, most specific first: this one command, then the one
+# you chose with `galla model`, then the default.
+chat_model() {
+    if [ -n "${GALLA_MODEL:-}" ]; then printf '%s' "$GALLA_MODEL"; return; fi
+    load_config
+    printf '%s' "${GALLA_SAVED_MODEL:-$DEFAULT_MODEL}"
+}
+
+cmd_models() {
+    local base; base="$(chat_endpoint)" ||
+        fail "can't reach Ollama. Start it with:  OLLAMA_ORIGINS=\"*\" ollama serve"
+    local current; current="$(chat_model)"
+    local names
+    names="$(curl -fsS --max-time 8 "$base/api/tags" 2>/dev/null | grep -o '"name":"[^"]*"' | sed 's/.*:"//; s/"$//')"
+    if [ -z "$names" ]; then
+        say "Ollama answered but has no models pulled yet."
+        say "  ollama pull $DEFAULT_MODEL"
+        return
+    fi
+    say "Models on this machine:"
+    local n
+    while IFS= read -r n; do
+        if [ "$n" = "$current" ] || [ "${n%:latest}" = "${current%:latest}" ]; then
+            printf '  * %s   (in use)\n' "$n"
+        else
+            printf '    %s\n' "$n"
+        fi
+    done <<<"$names"
+    say ""
+    say "Switch with:  galla model <name>"
+}
+
+cmd_model() {
+    local wanted="${1:-}"
+    if [ -z "$wanted" ]; then
+        say "$(chat_model)"
+        if [ -n "${GALLA_MODEL:-}" ]; then
+            say "(from GALLA_MODEL in this shell, which wins over the saved one)"
+        fi
+        return
+    fi
+
+    if [ "$wanted" = "default" ] || [ "$wanted" = "reset" ]; then
+        load_config; GALLA_SAVED_MODEL=""; save_config
+        say "Back to the default: $DEFAULT_MODEL"
+        return
+    fi
+
+    # Warn rather than refuse: Ollama may simply not be running right now, and
+    # being unable to check is not the same as the model being wrong.
+    local base
+    if base="$(chat_endpoint)"; then
+        if ! curl -fsS --max-time 8 "$base/api/tags" 2>/dev/null |
+             grep -q "\"name\":\"${wanted%:latest}\(:latest\)\?\""; then
+            warn "note: $wanted isn't pulled on this machine yet."
+            warn "      ollama pull $wanted"
+        fi
+    fi
+
+    load_config; GALLA_SAVED_MODEL="$wanted"; save_config
+    say "Galla will use $wanted."
+}
 
 # Text -> the inside of a JSON string.
 json_escape() {
@@ -538,7 +602,8 @@ cmd_chat() {
     base="$(chat_endpoint)" ||
         fail "can't reach Ollama. Start it with:  OLLAMA_ORIGINS=\"*\" ollama serve"
 
-    say "Galla is in $name   ($CHAT_MODEL)"
+    local model; model="$(chat_model)"
+    say "Galla is in $name   ($model)"
     say "Ask for what you want built. /files lists them, /publish ships it, /exit leaves."
     say ""
 
@@ -570,12 +635,12 @@ $line")\"}"
         printf 'Galla > '
         reply="$(curl -sS --no-buffer -X POST "$base/api/chat" \
             -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$CHAT_MODEL\",\"messages\":[$msgs],\"stream\":true}" \
+            -d "{\"model\":\"$model\",\"messages\":[$msgs],\"stream\":true}" \
             2>/dev/null | ndjson_text | tee /dev/stderr)"
         say ""
 
         if [ -z "$reply" ]; then
-            warn "no reply - is $CHAT_MODEL pulled?  ollama pull $CHAT_MODEL"
+            warn "no reply - is $model pulled?  ollama pull $model"
             continue
         fi
 
@@ -691,6 +756,8 @@ galla $VERSION - make things and put them on the web.
   galla publish <name> [message]  commit, push, and put it on GitHub Pages
 
   galla chat [name]             talk to Galla; it writes files in the project
+  galla models                  list the models on this machine
+  galla model [name]            show or change the model Galla uses
   galla connect                 let the chat app work with these projects
   galla token                   show the pairing token again
   galla update                  fetch the latest galla
@@ -712,6 +779,8 @@ main() {
         publish)  cmd_publish "$@" ;;
         chat)     cmd_chat "$@" ;;
         connect)  cmd_connect "$@" ;;
+        model)    cmd_model "$@" ;;
+        models)   cmd_models "$@" ;;
         token)    cmd_token "$@" ;;
         update|upgrade) cmd_update "$@" ;;
         help|-h|--help) cmd_help ;;

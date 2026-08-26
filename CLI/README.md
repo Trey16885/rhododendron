@@ -30,6 +30,8 @@ galla publish my-site       # commit, push, and put it on GitHub Pages
 galla list                  # what you have
 
 galla chat my-site          # talk to Galla; it writes the files
+galla models                # models on this machine
+galla model llama3.2        # switch which one Galla uses
 galla update                # fetch the latest galla
 ```
 
@@ -82,8 +84,32 @@ Inside the chat: `/files` lists them, `/publish` ships the project, `/exit` leav
 project is refused.
 
 This needs Ollama running (`OLLAMA_ORIGINS="*" ollama serve`), but no GitHub
-token — chatting and publishing are separate. Set `GALLA_MODEL` to use a model
-other than the default.
+token — chatting and publishing are separate.
+
+### Switching models
+
+```sh
+galla models                # what's on this machine; the one in use is marked *
+galla model                 # which one Galla is using
+galla model llama3.2        # switch to it, and remember that
+galla model default         # back to treyleo16/gpt-5-6-sol
+```
+
+The choice is saved in `~/.galla/config`, so it survives closing the terminal.
+
+For one command only, set `GALLA_MODEL` — it wins over the saved choice without
+replacing it:
+
+```sh
+GALLA_MODEL=llama3.2 galla chat my-site
+```
+
+So the order is: `GALLA_MODEL` in this shell → whatever `galla model` last saved
+→ `treyleo16/gpt-5-6-sol`.
+
+Naming a model Ollama hasn't pulled still sets it, with a note telling you to
+`ollama pull` it — being unable to check (Ollama not running) is not the same as
+the name being wrong, so it doesn't refuse.
 
 Memories from the chat app do not carry over: those live in the browser. This
 is a workspace, not the same conversation.
