@@ -18,6 +18,16 @@ for dep in git curl; do
     command -v "$dep" >/dev/null 2>&1 || fail "$dep is required but not installed."
 done
 
+# On Termux these are a package away and installing them is expected. Anywhere
+# else, installing system packages behind your back is not, so we only say what
+# is missing.
+if command -v pkg >/dev/null 2>&1 && [ -n "${PREFIX:-}" ]; then
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+        echo "Installing python and node (needed by 'galla connect') ..."
+        pkg install -y python nodejs-lts || echo "  (carry on; 'galla connect' will say if python is missing)"
+    fi
+fi
+
 mkdir -p "$BIN_DIR" "$WORKSPACE"
 
 # Installing from a clone (./install.sh) copies the sibling script; installing
@@ -39,6 +49,19 @@ head -n1 "$tmp" | grep -q '^#!' || fail "downloaded file is not a script (check 
 chmod +x "$tmp"
 mv "$tmp" "$BIN_DIR/galla"
 trap - EXIT
+
+# The connector ships alongside the CLI.
+CONFIG_DIR="${GALLA_CONFIG_DIR:-$HOME/.galla}"
+mkdir -p "$CONFIG_DIR"
+if [ -n "$here" ] && [ -f "$here/connector.py" ]; then
+    cp "$here/connector.py" "$CONFIG_DIR/connector.py"
+elif curl -fsSL "$REPO_RAW/connector.py" -o "$CONFIG_DIR/connector.py.tmp" 2>/dev/null &&
+     head -n1 "$CONFIG_DIR/connector.py.tmp" | grep -q '^#!'; then
+    mv "$CONFIG_DIR/connector.py.tmp" "$CONFIG_DIR/connector.py"
+else
+    rm -f "$CONFIG_DIR/connector.py.tmp"
+    say "(the connector could not be fetched; 'galla update' will retry)"
+fi
 
 say ""
 say "Installed:  $BIN_DIR/galla"

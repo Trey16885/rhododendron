@@ -21,7 +21,7 @@ done
 # written into a git remote: .git/config is world-readable and gets copied
 # around with the project.
 load_config() {
-    GALLA_PAT=""; GALLA_USER=""
+    GALLA_PAT=""; GALLA_USER=""; GALLA_CONNECT_TOKEN=""
     # Must not end on a failed test: under `set -e` a function returning
     # non-zero takes the whole script down, which on a first run (no config
     # yet) killed every command before it printed anything.
@@ -35,6 +35,9 @@ save_config() {
     {
         printf 'GALLA_PAT=%s\n' "$(printf '%q' "$GALLA_PAT")"
         printf 'GALLA_USER=%s\n' "$(printf '%q' "$GALLA_USER")"
+        # Persisted too, or pairing would break every time the connector
+        # restarted with a freshly generated token.
+        printf 'GALLA_CONNECT_TOKEN=%s\n' "$(printf '%q' "${GALLA_CONNECT_TOKEN:-}")"
     } > "$CONFIG"
     chmod 600 "$CONFIG"
 }
@@ -582,6 +585,53 @@ $line")\"}"
     say "Left $name."
 }
 
+# -------------------------------------------------------------- connector
+CONNECTOR="${GALLA_CONNECTOR:-$CONFIG_DIR/connector.py}"
+CONNECT_PORT=4316
+
+# The token is what stops the fixed port being enough on its own: anything else
+# on this machine can reach 4316, so reaching it must not be sufficient.
+connect_token() {
+    load_config
+    if [ -z "${GALLA_CONNECT_TOKEN:-}" ]; then
+        GALLA_CONNECT_TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        save_config
+    fi
+    printf '%s' "$GALLA_CONNECT_TOKEN"
+}
+
+cmd_connect() {
+    command -v python3 >/dev/null 2>&1 || fail \
+"python3 is needed to run the connector.
+  Termux:  pkg install -y python
+  Debian:  sudo apt install -y python3
+  macOS:   brew install python"
+
+    [ -f "$CONNECTOR" ] || fail "connector is missing from $CONNECTOR. Run 'galla update'."
+
+    local token; token="$(connect_token)"
+    say "Galla CLI connector"
+    say ""
+    say "  Port:      $CONNECT_PORT (loopback only)"
+    say "  Projects:  $WORKSPACE"
+    say ""
+    say "In the chat app, open Connectors and pair Galla CLI with this token:"
+    say ""
+    say "    $token"
+    say ""
+    say "Leave this running while you work. Ctrl-C disconnects."
+    say ""
+
+    GALLA_CONNECT_TOKEN="$token" \
+    GALLA_HOME="$WORKSPACE" \
+    GALLA_BIN="$(command -v galla 2>/dev/null || printf 'galla')" \
+    exec python3 "$CONNECTOR"
+}
+
+cmd_token() {
+    say "$(connect_token)"
+}
+
 # ----------------------------------------------------------------- update
 cmd_update() {
     local src="${GALLA_SOURCE:-https://raw.githubusercontent.com/Trey16885/rhododendron/main/CLI}"
@@ -611,6 +661,19 @@ cmd_update() {
 
     chmod +x "$tmp"
     mv "$tmp" "$target"
+
+    # The connector ships with the CLI and has to move with it.
+    local ctmp; ctmp="$(mktemp)"
+    if curl -fsSL "$src/connector.py" -o "$ctmp" 2>/dev/null &&
+       head -n1 "$ctmp" | grep -q '^#!' &&
+       python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ctmp" 2>/dev/null; then
+        mkdir -p "$CONFIG_DIR"
+        mv "$ctmp" "$CONNECTOR"
+    else
+        rm -f "$ctmp"
+        warn "  (the connector could not be updated; the CLI itself was)"
+    fi
+
     say "Updated $VERSION -> ${newver:-unknown}  ($target)"
 }
 
@@ -628,6 +691,8 @@ galla $VERSION - make things and put them on the web.
   galla publish <name> [message]  commit, push, and put it on GitHub Pages
 
   galla chat [name]             talk to Galla; it writes files in the project
+  galla connect                 let the chat app work with these projects
+  galla token                   show the pairing token again
   galla update                  fetch the latest galla
 
 Projects live in $WORKSPACE
@@ -646,6 +711,8 @@ main() {
         link)     cmd_link "$@" ;;
         publish)  cmd_publish "$@" ;;
         chat)     cmd_chat "$@" ;;
+        connect)  cmd_connect "$@" ;;
+        token)    cmd_token "$@" ;;
         update|upgrade) cmd_update "$@" ;;
         help|-h|--help) cmd_help ;;
         version|-v|--version) say "galla $VERSION" ;;

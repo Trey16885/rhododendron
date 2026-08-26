@@ -34,7 +34,8 @@
         activeGemId: null,
         activeGemPrompt: "",
         busy: false,
-        controller: null
+        controller: null,
+        editingConnector: null
     };
     const verifiedModels = new Set();
 
@@ -705,6 +706,184 @@
         "asked to create, edit or publish files, say so rather than pretending " +
         "to do it.\n\n";
 
+    // -------------------------------------------------------------- Connectors
+    // Galla CLI is built in and fixed: it always lives on 4316, and it cannot be
+    // edited or removed, so there is one address that is always what it says it
+    // is. Everything else here is yours to add and remove.
+    const BUILTIN_CONNECTOR = {
+        id: "galla-cli",
+        name: "Galla CLI",
+        url: "http://localhost:4316",
+        builtin: true
+    };
+
+    const connectorState = new Map();   // id -> "off" | "found" | "on"
+
+    function loadConnectors() {
+        let custom = [];
+        try {
+            const raw = readSetting("connectors", "");
+            if (raw) custom = JSON.parse(raw).filter((c) => c && c.id && !c.builtin);
+        } catch (err) { custom = []; }
+        return [BUILTIN_CONNECTOR].concat(custom);
+    }
+
+    function saveConnectors(list) {
+        writeSetting("connectors", JSON.stringify(list.filter((c) => !c.builtin)));
+    }
+
+    function connectorToken(id) { return readSetting("connector-token-" + id, "") || ""; }
+    function setConnectorToken(id, token) { writeSetting("connector-token-" + id, token || null); }
+
+    async function connectorFetch(conn, path, options) {
+        const opts = Object.assign({}, options);
+        opts.headers = Object.assign({}, opts.headers);
+        const token = connectorToken(conn.id);
+        if (token) opts.headers.Authorization = "Bearer " + token;
+        if (opts.body) opts.headers["Content-Type"] = "application/json";
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+        try {
+            const res = await fetch(conn.url + path, Object.assign(opts, { signal: controller.signal }));
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+            return data;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async function probeConnector(conn) {
+        try {
+            const health = await connectorFetch(conn, "/health", { method: "GET" });
+            // Reachable but unpaired is worth distinguishing from absent: one
+            // needs a token, the other needs the connector started.
+            connectorState.set(conn.id, health.paired ? "on" : "found");
+        } catch (err) {
+            connectorState.set(conn.id, "off");
+        }
+        return connectorState.get(conn.id);
+    }
+
+    function connectedConnectors() {
+        return loadConnectors().filter((c) => connectorState.get(c.id) === "on");
+    }
+
+    function renderConnectors() {
+        const list = loadConnectors();
+        const frag = document.createDocumentFragment();
+        const labels = { on: "connected", found: "needs pairing", off: "offline" };
+
+        list.forEach((conn) => {
+            const state = connectorState.get(conn.id) || "off";
+            const row = document.createElement("div");
+            row.className = "connector-row";
+            row.dataset.connectorId = conn.id;
+            row.title = conn.url;
+
+            const dot = document.createElement("span");
+            dot.className = "connector-dot " + (state === "off" ? "" : state);
+            const name = document.createElement("span");
+            name.className = "connector-name";
+            name.textContent = conn.name;
+            const status = document.createElement("span");
+            status.className = "connector-state";
+            status.textContent = labels[state];
+            row.append(dot, name, status);
+
+            if (conn.builtin) {
+                const lock = document.createElement("span");
+                lock.className = "connector-locked";
+                lock.textContent = "🔒";
+                lock.title = "Built in: always on port 4316, can't be edited or removed";
+                row.appendChild(lock);
+            } else {
+                const remove = document.createElement("button");
+                remove.className = "connector-remove";
+                remove.type = "button";
+                remove.textContent = "×";
+                remove.title = "Remove " + conn.name;
+                remove.dataset.removeConnector = conn.id;
+                row.appendChild(remove);
+            }
+            frag.appendChild(row);
+        });
+        els.connectorList.replaceChildren(frag);
+    }
+
+    async function refreshConnectors() {
+        const list = loadConnectors();
+        renderConnectors();
+        await Promise.all(list.map(probeConnector));
+        renderConnectors();
+    }
+
+    function openConnectorModal(conn) {
+        const isBuiltin = !!(conn && conn.builtin);
+        state.editingConnector = conn || null;
+        els.connectorModalTitle.textContent = conn ? conn.name : "Add a connector";
+        els.connectorNote.textContent = isBuiltin
+            ? "Run `galla connect` in a terminal, then paste the token it prints."
+            : "The connector's address, and the token it printed.";
+        els.connectorName.value = conn ? conn.name : "";
+        els.connectorUrl.value = conn ? conn.url : "";
+        els.connectorToken.value = conn ? connectorToken(conn.id) : "";
+        // The built-in one is fixed on purpose: its whole value is being a
+        // known address that nothing else can quietly redefine.
+        els.connectorName.disabled = isBuiltin;
+        els.connectorUrl.disabled = isBuiltin;
+        openModal("connector-modal");
+        els.connectorToken.focus();
+    }
+
+    async function saveConnector() {
+        const editing = state.editingConnector;
+        const token = els.connectorToken.value.trim();
+        let conn;
+
+        if (editing && editing.builtin) {
+            conn = BUILTIN_CONNECTOR;
+        } else {
+            const name = els.connectorName.value.trim();
+            const url = els.connectorUrl.value.trim().replace(/\/+$/, "");
+            if (!name || !url) { els.connectorName.focus(); return; }
+            if (!/^https?:\/\//i.test(url)) {
+                alert("The address needs to start with http:// or https://");
+                return;
+            }
+            const list = loadConnectors();
+            conn = editing || { id: "c" + generateId(), name: name, url: url };
+            conn.name = name; conn.url = url;
+            const rest = list.filter((c) => !c.builtin && c.id !== conn.id);
+            saveConnectors(rest.concat([conn]));
+        }
+
+        setConnectorToken(conn.id, token);
+        const result = await probeConnector(conn);
+        renderConnectors();
+
+        if (result === "on") {
+            closeModal("connector-modal");
+            renderNote(conn.name + " is connected. Galla can work with your projects now.");
+        } else if (result === "found") {
+            alert("Reached " + conn.name + ", but that token was not accepted.\n\n" +
+                  "Run `galla token` to see the current one.");
+        } else {
+            alert("Couldn't reach " + conn.url + ".\n\n" +
+                  (conn.builtin ? "Start it with `galla connect` in a terminal." : "Check the address."));
+        }
+    }
+
+    function removeConnector(id) {
+        const list = loadConnectors();
+        const conn = list.find((c) => c.id === id);
+        if (!conn || conn.builtin) return;          // built-in is not removable
+        saveConnectors(list.filter((c) => c.id !== id));
+        setConnectorToken(id, null);
+        connectorState.delete(id);
+        renderConnectors();
+    }
+
     // ------------------------------------------------------------------ Memory
     // /memory and /recall are handled here, by the app, not by the model: the
     // model is only told the commands exist, and could not write to storage on
@@ -738,7 +917,42 @@
         publish: "galla publish <project>"
     };
 
-    const KNOWN_COMMANDS = new Set(["memory", "recall", "edit", "create", "publish"]);
+    const KNOWN_COMMANDS = new Set(["memory", "recall", "edit", "create", "publish", "projects"]);
+
+    // With the CLI connected these stop being advice and start doing the thing.
+    async function runThroughConnector(conn, name, arg) {
+        try {
+            if (name === "publish") {
+                const project = arg || (await connectorFetch(conn, "/projects", { method: "GET" })).projects[0];
+                if (!project) return "There are no projects yet. Make one with: galla new <name>";
+                const out = await connectorFetch(conn, "/publish", {
+                    method: "POST",
+                    body: JSON.stringify({ project: project, message: "Update from Galla" })
+                });
+                return out.ok ? "Published " + project + ".\n\n" + out.output
+                              : "Publishing " + project + " failed:\n\n" + out.output;
+            }
+
+            if (name === "create" || name === "edit") {
+                // Listing is all this can do from a chat message: the content
+                // has to come from Galla's reply, not from a one-line command.
+                const project = arg.split(/\s+/)[0];
+                if (!project) {
+                    const all = await connectorFetch(conn, "/projects", { method: "GET" });
+                    return all.projects.length
+                        ? "Which project? You have:\n" + all.projects.map((p) => "• " + p).join("\n")
+                        : "There are no projects yet. Make one with: galla new <name>";
+                }
+                const listing = await connectorFetch(conn, "/files?project=" + encodeURIComponent(project), { method: "GET" });
+                return project + " contains:\n" +
+                       listing.files.map((f) => "• " + f.path).join("\n") +
+                       "\n\nAsk Galla for the change and it will write the files.";
+            }
+        } catch (err) {
+            return "The Galla CLI connector refused that: " + err.message;
+        }
+        return null;
+    }
 
     // Pulls command lines out of a reply, leaving the prose. Lines inside a
     // fenced code block are left alone: a model showing you what /memory looks
@@ -790,9 +1004,14 @@
         }
 
         if (CLI_COMMANDS[name]) {
-            return "/" + name + " lives in the Galla CLI, not in this chat — " +
-                   "a browser tab has no files to work on. In a terminal:\n\n" +
-                   CLI_COMMANDS[name] + "\n\nInstall it with:\n" +
+            const cli = loadConnectors().find((c) => c.id === "galla-cli");
+            if (connectorState.get("galla-cli") === "on") {
+                return await runThroughConnector(cli, name, arg);
+            }
+            return "/" + name + " needs the Galla CLI connector, which isn't " +
+                   "connected. In a terminal:\n\n    galla connect\n\n" +
+                   "then pair it under Connectors. Without it a browser tab has " +
+                   "no files to work on.\n\nNot installed yet?\n" +
                    "curl -fsSL https://raw.githubusercontent.com/Trey16885/" +
                    "rhododendron/main/CLI/install.sh | bash";
         }
@@ -1140,7 +1359,10 @@
             sendBtn: "send-btn", gemName: "gem-name", gemPrompt: "gem-prompt",
             importFile: "import-file", missingModelName: "missing-model-name",
             pullCommand: "pull-command", triedEndpoints: "tried-endpoints",
-            gemBadge: "gem-badge", sidebarClose: "sidebar-close"
+            gemBadge: "gem-badge", sidebarClose: "sidebar-close",
+            connectorList: "connector-list", connectorModalTitle: "connector-modal-title",
+            connectorNote: "connector-modal-note", connectorName: "connector-name",
+            connectorUrl: "connector-url", connectorToken: "connector-token"
         };
         for (const key in ids) els[key] = document.getElementById(ids[key]);
     }
@@ -1176,6 +1398,17 @@
         els.gemList.addEventListener("click", (e) => {
             const btn = e.target.closest("button");
             if (btn) activateGem(btn.dataset.gemId || null);
+        });
+
+        document.getElementById("add-connector-btn").addEventListener("click", () => openConnectorModal(null));
+        document.getElementById("connector-save-btn").addEventListener("click", () => { saveConnector(); });
+        els.connectorList.addEventListener("click", (e) => {
+            const remove = e.target.closest("[data-remove-connector]");
+            if (remove) { removeConnector(remove.dataset.removeConnector); return; }
+            const row = e.target.closest("[data-connector-id]");
+            if (!row) return;
+            const conn = loadConnectors().find((c) => c.id === row.dataset.connectorId);
+            if (conn) openConnectorModal(conn);
         });
 
         els.sendBtn.addEventListener("click", () => { sendMessage(); });
@@ -1220,6 +1453,11 @@
         }
 
         state.activeGemId = readSetting("activeGemId", null) || null;
+
+        // Drawn immediately, then probed: the list should appear at once rather
+        // than after a connector that isn't running has timed out.
+        renderConnectors();
+        refreshConnectors().catch(() => {});
 
         const lastChatId = readSetting("lastChatId", null);
         await pruneEmptyChats(lastChatId).catch(() => {});
