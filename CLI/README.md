@@ -28,7 +28,39 @@ galla open my-site          # resume it - opens a shell in the folder
 galla link my-site          # pick a repo, or make a new one
 galla publish my-site       # commit, push, and put it on GitHub Pages
 galla list                  # what you have
+
+galla chat my-site          # talk to Galla; it writes the files
+galla update                # fetch the latest galla
 ```
+
+## Talking to Galla
+
+```sh
+galla chat my-site          # or just `galla chat` inside the folder
+```
+
+Galla sees the project's files and writes what you ask for:
+
+```
+you   > make the heading blue and add an about page
+Galla > Updated the heading colour and added a second page.
+  wrote index.html
+  wrote about.html
+you   > /publish
+```
+
+Inside the chat: `/files` lists them, `/publish` ships the project, `/exit` leaves.
+
+**New files are written straight away. Anything that already exists asks first**
+— that file is your work until you say otherwise. A path pointing outside the
+project is refused.
+
+This needs Ollama running (`OLLAMA_ORIGINS="*" ollama serve`), but no GitHub
+token — chatting and publishing are separate. Set `GALLA_MODEL` to use a model
+other than the default.
+
+Memories from the chat app do not carry over: those live in the browser. This
+is a workspace, not the same conversation.
 
 ### The token
 
