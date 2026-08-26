@@ -30,6 +30,8 @@ galla publish my-site       # commit, push, and put it on GitHub Pages
 galla list                  # what you have
 
 galla chat my-site          # talk to Galla; it writes the files
+galla models                # the models Galla can use
+galla model opus-1          # switch which one Galla uses
 galla update                # fetch the latest galla
 ```
 
@@ -82,8 +84,54 @@ Inside the chat: `/files` lists them, `/publish` ships the project, `/exit` leav
 project is refused.
 
 This needs Ollama running (`OLLAMA_ORIGINS="*" ollama serve`), but no GitHub
-token — chatting and publishing are separate. Set `GALLA_MODEL` to use a model
-other than the default.
+token — chatting and publishing are separate.
+
+### Switching models
+
+```sh
+galla models                # the five Galla models; the one in use is marked *
+galla model                 # which one Galla is using
+galla model opus-1          # switch to it, and remember that
+galla model default         # back to GPT 5.6 Sol
+```
+
+These five are the whole list, the same ones the chat app offers, so a project
+behaves the same whichever end you drive it from:
+
+| | |
+|---|---|
+| `treyleo16/gpt-5-6-sol` | GPT 5.6 Sol — the default |
+| `rhododendron/galla:sonnet-1` | GallaSonnet 1 Pro |
+| `rhododendron/galla:opus-1` | GallaOpus 1 |
+| `rhododendron/galla:1` | Galla 1 |
+| `rhododendron/galla:1-pro` | Galla 1 Pro |
+
+**Nothing else resolves.** Another model may be sitting on the same machine —
+`galla model llama3.2` still won't take it, and `galla models` won't list it.
+Galla's instructions are written for these models and a project should behave
+the same wherever it's opened, so the roster is the product, not a default to
+be talked out of.
+
+Say a model however is natural: the full id, the name from the chat app, or the
+short end of it. Capitals, spaces, dots and dashes are all ignored, so
+`GallaOpus 1`, `galla:opus-1` and `opus` are one name.
+
+The choice is saved in `~/.galla/config`, so it survives closing the terminal.
+
+For one command only, set `GALLA_MODEL` — it wins over the saved choice without
+replacing it:
+
+```sh
+GALLA_MODEL=sonnet galla chat my-site
+```
+
+So the order is: `GALLA_MODEL` in this shell → whatever `galla model` last saved
+→ `treyleo16/gpt-5-6-sol`. The roster applies to the environment variable too;
+an escape hatch there would mean there was no roster.
+
+Naming a Galla model Ollama hasn't pulled still sets it, with a note telling you
+to `ollama pull` it — being unable to check (Ollama not running) is not the same
+as the name being wrong, so it doesn't refuse.
 
 Memories from the chat app do not carry over: those live in the browser. This
 is a workspace, not the same conversation.
