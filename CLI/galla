@@ -58,6 +58,26 @@ api() {
     curl "${args[@]}" "$API$path"
 }
 
+# git prints the URL it failed on, and for a push that URL carries the token.
+# Anything from git therefore goes through here before it is shown.
+redact() {
+    if [ -n "${GALLA_PAT:-}" ]; then
+        sed "s|$GALLA_PAT|***|g"
+    else
+        cat
+    fi
+}
+
+# Status code and GitHub's own message for one call, for diagnosing rather
+# than doing. Prints "<code> <message>".
+api_probe() {
+    local out code body
+    out="$(api "$@" 2>/dev/null)" || { printf '??? could not reach GitHub'; return 1; }
+    code="$(tail -n1 <<<"$out")"
+    body="$(sed '$d' <<<"$out")"
+    printf '%s %s' "$code" "$(json_field "$body" message)"
+}
+
 api_ok() {   # prints the body, returns non-zero on an HTTP error
     local out code
     out="$(api "$@")" || return 1
@@ -371,8 +391,15 @@ cmd_publish() {
             ;;
     esac
 
-    if ! git -C "$dir" push -q "$push_url" main 2>/dev/null; then
-        fail "push failed. The token needs Contents: Read and write on $repo, and must not have expired."
+    local push_err
+    if ! push_err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+        warn "galla: push to $repo failed. git said:"
+        warn ""
+        printf '%s\n' "$push_err" | redact | sed 's/^/  /' >&2
+        warn ""
+        warn "If that is about permission, the token needs Contents: Read and write"
+        warn "on $repo, and must not have expired. 'galla doctor $name' checks."
+        exit 1
     fi
     say "Pushed."
 
@@ -387,16 +414,45 @@ cmd_publish() {
 
     say ""
     say "Turning on GitHub Pages ..."
-    if api_ok POST "/repos/$repo/pages" '{"source":{"branch":"main","path":"/"}}' >/dev/null 2>&1; then
+    local pages_body pages_msg
+    if pages_body="$(api_ok POST "/repos/$repo/pages" '{"source":{"branch":"main","path":"/"}}' 2>/dev/null)"; then
         say "Pages is on."
         say ""
         say "Live at: $site"
         say "The first build takes about a minute."
     else
-        # Pages: Read and write is the permission for this, and it is the one
-        # people most often leave off. The manual route always works.
-        say "Couldn't switch Pages on with this token."
-        say "(Add 'Pages: Read and write' to it, or just do it once by hand:)"
+        # Say what GitHub said, not what we guess it meant. Every cause below
+        # arrives as the same failed POST, and only the message tells them
+        # apart -- an earlier version asserted "add the Pages permission" for
+        # all of them, which is wrong whenever the token was already fine.
+        pages_msg="$(json_field "$pages_body" message)"
+        say "Couldn't switch Pages on."
+        if [ -n "$pages_msg" ]; then
+            say ""
+            say "  GitHub said: $pages_msg"
+        fi
+        say ""
+        case "$pages_msg" in
+            *[Uu]pgrade*|*private*|*[Pp]lan*)
+                say "That is about the repository being private, not about the token:"
+                say "Pages on a private repo needs a paid plan. Making $repo public"
+                say "is the free way, or do it by hand below."
+                ;;
+            *"not accessible by personal access token"*)
+                say "That is the token. Check, at"
+                say "https://github.com/settings/personal-access-tokens :"
+                say "  - Pages is set to Read and write"
+                say "  - the resource owner is $GALLA_USER, not an organisation"
+                say "  - repository access covers $repo"
+                ;;
+            *"Not Found"*)
+                say "A 'Not Found' here usually means the token cannot see $repo at all"
+                say "- it is scoped to selected repositories and this one is not among"
+                say "them, or its resource owner is a different account."
+                ;;
+        esac
+        say ""
+        say "Or just do it once by hand:"
         say ""
         say "  1. Open https://github.com/$repo/settings/pages"
         say "  2. Under 'Build and deployment', set Source to 'Deploy from a branch'"
@@ -407,6 +463,101 @@ cmd_publish() {
     fi
     say ""
     say "From now on 'galla publish $name' updates the site in about a minute."
+}
+
+# ----------------------------------------------------------------- doctor
+# "It says I need the permission, but I have it." Publishing can fail for
+# several reasons that all surface as one refused call, so this asks GitHub
+# about each one separately and reports what came back rather than guessing.
+cmd_doctor() {
+    require_auth
+    local name="${1:-}" repo="" dir=""
+    if [ -n "$name" ]; then
+        dir="$(require_project "$name")"
+        repo="$(project_repo "$dir")"
+    fi
+
+    say "Token"
+    local body code
+    body="$(api GET /user 2>/dev/null)" || { say "  cannot reach GitHub."; return 1; }
+    code="$(tail -n1 <<<"$body")"; body="$(sed '$d' <<<"$body")"
+    if [ "$code" != "200" ]; then
+        say "  REJECTED  $(json_field "$body" message)"
+        say ""
+        say "  The token is wrong or has expired. Run 'galla auth' with a new one."
+        return 1
+    fi
+    say "  ok        signed in as $(json_field "$body" login)"
+
+    if [ -z "$repo" ]; then
+        say ""
+        if [ -n "$name" ]; then
+            say "'$name' isn't linked to a repository yet - run 'galla link $name'."
+        else
+            say "Name a project to check its repository too:  galla doctor <project>"
+        fi
+        return 0
+    fi
+
+    say ""
+    say "Repository  $repo"
+    body="$(api GET "/repos/$repo" 2>/dev/null)"
+    code="$(tail -n1 <<<"$body")"; body="$(sed '$d' <<<"$body")"
+    case "$code" in
+        200)
+            local private; private="$(grep -o '"private"[[:space:]]*:[[:space:]]*[a-z]*' <<<"$body" | head -n1 | grep -o '[a-z]*$')"
+            if [ "$private" = "true" ]; then
+                say "  visible   yes, and it is PRIVATE"
+                say "            Pages on a private repo needs a paid plan. This is the"
+                say "            most common reason publishing refuses a token that is"
+                say "            in fact correct. Making it public is the free fix."
+            else
+                say "  visible   yes, public"
+            fi
+            ;;
+        404)
+            say "  NOT FOUND to this token."
+            say "            The repo may not exist, or the token is scoped to selected"
+            say "            repositories and this is not one of them, or its resource"
+            say "            owner is a different account. GitHub returns 404 rather"
+            say "            than 403 here, so it looks like the repo is missing."
+            return 1
+            ;;
+        *)  say "  $code  $(json_field "$body" message)" ;;
+    esac
+
+    say ""
+    say "Permissions, as GitHub answers them"
+    local probe
+    probe="$(api_probe GET "/repos/$repo/pages")"
+    case "$probe" in
+        200*) say "  Pages     read ok, and Pages is already switched on" ;;
+        404*) say "  Pages     read ok, Pages not switched on yet" ;;
+        403*) say "  Pages     REFUSED - ${probe#403 }" ;;
+        *)    say "  Pages     $probe" ;;
+    esac
+
+    # Contents cannot be probed without writing, so ask git the same question
+    # a push asks, which authenticates without changing anything.
+    local remote push_url
+    remote="$(git -C "$dir" remote get-url origin 2>/dev/null || printf '')"
+    if [ -n "$remote" ]; then
+        push_url="$remote"
+        case "$remote" in
+            https://github.com/*) push_url="https://x-access-token:$GALLA_PAT@github.com/${remote#https://github.com/}" ;;
+        esac
+        local ls_err
+        if ls_err="$(git ls-remote "$push_url" HEAD 2>&1)"; then
+            say "  Contents  git can authenticate to $repo"
+        else
+            say "  Contents  git could NOT authenticate:"
+            printf '%s\n' "$ls_err" | redact | sed 's/^/              /'
+        fi
+    fi
+
+    say ""
+    say "If everything above is ok but publishing still refuses, the message"
+    say "'galla publish $name' prints is now GitHub's own - send that."
 }
 
 # ------------------------------------------------------------------- chat
@@ -818,46 +969,21 @@ cmd_token() {
 # ----------------------------------------------------------------- update
 cmd_update() {
     local src="${GALLA_SOURCE:-https://raw.githubusercontent.com/Trey16885/rhododendron/main/CLI}"
-    local target; target="$(command -v galla 2>/dev/null || printf '%s' "${GALLA_BIN_DIR:-$HOME/.local/bin}/galla")"
-    [ -w "$(dirname "$target")" ] || fail "can't write to $(dirname "$target")."
 
-    say "Fetching the latest galla ..."
-    local tmp; tmp="$(mktemp)"
-    if ! curl -fsSL "$src/galla" -o "$tmp"; then
-        rm -f "$tmp"; fail "download failed. Check your connection, or $src"
+    # One code path: whatever `curl ... | bash` does for a new install is what
+    # an update does too.
+    #
+    # This used to fetch galla itself and compare VERSION strings, stopping
+    # early when they matched. VERSION sat at 1.0.0 through every release, so
+    # the comparison was always equal and the update always declined -- it
+    # reported success while installing nothing. A number someone has to
+    # remember to bump is not a safety check, it is a second thing to get
+    # wrong; the installer simply fetches and replaces.
+    say "Running the installer ..."
+    say ""
+    if ! curl -fsSL "$src/install.sh" | GALLA_SOURCE="$src" bash; then
+        fail "update failed. The installer verifies before it replaces anything, so galla is untouched."
     fi
-
-    # Do not trust the download. Files in this project have arrived truncated
-    # before, and replacing a working CLI with half a script would leave no way
-    # to update back out of it.
-    if ! head -n1 "$tmp" | grep -q '^#!'; then
-        rm -f "$tmp"; fail "that wasn't a script (is the URL right?). Nothing changed."
-    fi
-    if ! bash -n "$tmp" 2>/dev/null; then
-        rm -f "$tmp"; fail "the downloaded script is incomplete or broken. Nothing changed."
-    fi
-
-    local newver; newver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
-    if [ "$newver" = "$VERSION" ]; then
-        rm -f "$tmp"; say "Already on $VERSION."; return 0
-    fi
-
-    chmod +x "$tmp"
-    mv "$tmp" "$target"
-
-    # The connector ships with the CLI and has to move with it.
-    local ctmp; ctmp="$(mktemp)"
-    if curl -fsSL "$src/connector.py" -o "$ctmp" 2>/dev/null &&
-       head -n1 "$ctmp" | grep -q '^#!' &&
-       python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ctmp" 2>/dev/null; then
-        mkdir -p "$CONFIG_DIR"
-        mv "$ctmp" "$CONNECTOR"
-    else
-        rm -f "$ctmp"
-        warn "  (the connector could not be updated; the CLI itself was)"
-    fi
-
-    say "Updated $VERSION -> ${newver:-unknown}  ($target)"
 }
 
 cmd_help() {
@@ -878,6 +1004,7 @@ galla $VERSION - make things and put them on the web.
   galla model [name]            show or change the model Galla uses
   galla connect                 let the chat app work with these projects
   galla token                   show the pairing token again
+  galla doctor [project]        check the token against GitHub, permission by permission
   galla update                  fetch the latest galla
 
 Projects live in $WORKSPACE
@@ -897,6 +1024,7 @@ main() {
         publish)  cmd_publish "$@" ;;
         chat)     cmd_chat "$@" ;;
         connect)  cmd_connect "$@" ;;
+        doctor)   cmd_doctor "$@" ;;
         model)    cmd_model "$@" ;;
         models)   cmd_models "$@" ;;
         token)    cmd_token "$@" ;;

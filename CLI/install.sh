@@ -28,11 +28,25 @@ if command -v pkg >/dev/null 2>&1 && [ -n "${PREFIX:-}" ]; then
     fi
 fi
 
+# Being unable to check is not the same as the file being wrong: without
+# python3 there is nothing to parse with, and the connector needs python3 to
+# run anyway, so it will say so at that point.
+python_parses() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$1" 2>/dev/null
+}
+
 mkdir -p "$BIN_DIR" "$WORKSPACE"
 
 # Installing from a clone (./install.sh) copies the sibling script; installing
 # over curl fetches it.
-here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+# Only when this file is actually a file. Piped in over curl -- which is how
+# `galla update` runs it -- BASH_SOURCE is not a path, and resolving it to the
+# working directory would install a stray ./galla instead of downloading.
+here=""
+if [ -f "${BASH_SOURCE[0]:-/nonexistent}" ]; then
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
@@ -44,7 +58,12 @@ else
     say "Downloaded galla from $REPO_RAW"
 fi
 
+# Do not trust the download. Files in this project have arrived truncated
+# before, and installing half a script would leave no way to update back out
+# of it. This check used to live in `galla update`; it belongs here, now that
+# update is this installer.
 head -n1 "$tmp" | grep -q '^#!' || fail "downloaded file is not a script (check the URL)"
+bash -n "$tmp" 2>/dev/null || fail "the downloaded galla is incomplete or broken; nothing was changed"
 
 chmod +x "$tmp"
 mv "$tmp" "$BIN_DIR/galla"
@@ -56,7 +75,8 @@ mkdir -p "$CONFIG_DIR"
 if [ -n "$here" ] && [ -f "$here/connector.py" ]; then
     cp "$here/connector.py" "$CONFIG_DIR/connector.py"
 elif curl -fsSL "$REPO_RAW/connector.py" -o "$CONFIG_DIR/connector.py.tmp" 2>/dev/null &&
-     head -n1 "$CONFIG_DIR/connector.py.tmp" | grep -q '^#!'; then
+     head -n1 "$CONFIG_DIR/connector.py.tmp" | grep -q '^#!' &&
+     python_parses "$CONFIG_DIR/connector.py.tmp"; then
     mv "$CONFIG_DIR/connector.py.tmp" "$CONFIG_DIR/connector.py"
 else
     rm -f "$CONFIG_DIR/connector.py.tmp"
@@ -73,7 +93,7 @@ case ":$PATH:" in
         say ""
         say "$BIN_DIR is not on your PATH. Add it with:"
         say ""
-        say "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && exec bash"
+        say "    echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.bashrc && exec bash"
         say ""
         say "Then run 'galla' to get started."
         ;;
