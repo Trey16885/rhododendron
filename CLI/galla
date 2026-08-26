@@ -969,46 +969,21 @@ cmd_token() {
 # ----------------------------------------------------------------- update
 cmd_update() {
     local src="${GALLA_SOURCE:-https://raw.githubusercontent.com/Trey16885/rhododendron/main/CLI}"
-    local target; target="$(command -v galla 2>/dev/null || printf '%s' "${GALLA_BIN_DIR:-$HOME/.local/bin}/galla")"
-    [ -w "$(dirname "$target")" ] || fail "can't write to $(dirname "$target")."
 
-    say "Fetching the latest galla ..."
-    local tmp; tmp="$(mktemp)"
-    if ! curl -fsSL "$src/galla" -o "$tmp"; then
-        rm -f "$tmp"; fail "download failed. Check your connection, or $src"
+    # One code path: whatever `curl ... | bash` does for a new install is what
+    # an update does too.
+    #
+    # This used to fetch galla itself and compare VERSION strings, stopping
+    # early when they matched. VERSION sat at 1.0.0 through every release, so
+    # the comparison was always equal and the update always declined -- it
+    # reported success while installing nothing. A number someone has to
+    # remember to bump is not a safety check, it is a second thing to get
+    # wrong; the installer simply fetches and replaces.
+    say "Running the installer ..."
+    say ""
+    if ! curl -fsSL "$src/install.sh" | GALLA_SOURCE="$src" bash; then
+        fail "update failed. The installer verifies before it replaces anything, so galla is untouched."
     fi
-
-    # Do not trust the download. Files in this project have arrived truncated
-    # before, and replacing a working CLI with half a script would leave no way
-    # to update back out of it.
-    if ! head -n1 "$tmp" | grep -q '^#!'; then
-        rm -f "$tmp"; fail "that wasn't a script (is the URL right?). Nothing changed."
-    fi
-    if ! bash -n "$tmp" 2>/dev/null; then
-        rm -f "$tmp"; fail "the downloaded script is incomplete or broken. Nothing changed."
-    fi
-
-    local newver; newver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
-    if [ "$newver" = "$VERSION" ]; then
-        rm -f "$tmp"; say "Already on $VERSION."; return 0
-    fi
-
-    chmod +x "$tmp"
-    mv "$tmp" "$target"
-
-    # The connector ships with the CLI and has to move with it.
-    local ctmp; ctmp="$(mktemp)"
-    if curl -fsSL "$src/connector.py" -o "$ctmp" 2>/dev/null &&
-       head -n1 "$ctmp" | grep -q '^#!' &&
-       python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ctmp" 2>/dev/null; then
-        mkdir -p "$CONFIG_DIR"
-        mv "$ctmp" "$CONNECTOR"
-    else
-        rm -f "$ctmp"
-        warn "  (the connector could not be updated; the CLI itself was)"
-    fi
-
-    say "Updated $VERSION -> ${newver:-unknown}  ($target)"
 }
 
 cmd_help() {

@@ -33,8 +33,28 @@ galla doctor my-site        # why is GitHub refusing? ask it, permission by perm
 galla chat my-site          # talk to Galla; it writes the files
 galla models                # the models Galla can use
 galla model opus-1          # switch which one Galla uses
-galla update                # fetch the latest galla
+galla update                # re-run the installer; always fetches
 ```
+
+## Updating
+
+```sh
+galla update
+```
+
+It runs the same installer the `curl` line above runs, so there is one code
+path and nothing to keep in step. It always fetches and replaces — there is no
+version comparison to go stale.
+
+There used to be one, and it was the bug: `VERSION` stayed at `1.0.0` through
+every release, so `galla update` compared it against itself, said "Already on
+1.0.0" and installed nothing. It reported success every time while doing
+nothing at all.
+
+The installer verifies before it replaces: the download must start with `#!`
+**and** pass `bash -n`. Files in this project have arrived truncated more than
+once, and installing half a script would leave no way to update back out of it.
+A bad download changes nothing.
 
 ## Connectors
 
