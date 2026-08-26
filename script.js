@@ -290,6 +290,46 @@
         return fillBubble(appendBubble(sender), sender, text);
     }
 
+    // A write Galla asked for, held until you agree. Deliberately not persisted
+    // while pending: a reload drops the offer rather than leaving a live button
+    // for something you never saw proposed.
+    function renderConfirm(promptText, onAccept) {
+        const div = document.createElement("div");
+        div.className = "note-message confirm-note";
+
+        const label = document.createElement("div");
+        label.textContent = promptText;
+        div.appendChild(label);
+
+        const row = document.createElement("div");
+        row.className = "confirm-actions";
+        const yes = document.createElement("button");
+        yes.type = "button";
+        yes.className = "confirm-btn";
+        yes.textContent = "Remember it";
+        const no = document.createElement("button");
+        no.type = "button";
+        no.className = "confirm-btn secondary";
+        no.textContent = "No thanks";
+        row.append(yes, no);
+        div.appendChild(row);
+
+        const settle = (text) => {
+            div.classList.remove("confirm-note");
+            div.replaceChildren();
+            div.textContent = text;
+        };
+        yes.addEventListener("click", async () => {
+            row.remove();
+            settle(await onAccept());
+        });
+        no.addEventListener("click", () => settle("Not remembered."));
+
+        els.chatContainer.appendChild(div);
+        scrollToBottom();
+        return div;
+    }
+
     // App-level output (command results). Kept out of the model's context by
     // buildApiMessages so it never looks like something the assistant said.
     function renderNote(text) {
@@ -658,7 +698,13 @@
         "/edit - edit files/folders\n" +
         "/create - create files/folders\n" +
         "/publish - zip every file in the workspace and publish it to a site " +
-        "(Output the published link formatted as domain.domain/?project=urlsafecharacters)\n\n";
+        "(Output the published link formatted as domain.domain/?project=urlsafecharacters)\n" +
+        "To run one, write it on a line of its own, e.g.\n" +
+        "/memory Trey prefers short answers\n" +
+        "The line is taken out of your reply, so do not also describe running " +
+        "it. /memory is offered to the user to accept before it is stored. " +
+        "Anything already listed under [MEMORY] is known to you and does not " +
+        "need recalling.\n\n";
 
     // ------------------------------------------------------------------ Memory
     // /memory and /recall are handled here, by the app, not by the model: the
@@ -691,6 +737,27 @@
         create: "creating files",
         publish: "publishing a workspace"
     };
+
+    const KNOWN_COMMANDS = new Set(["memory", "recall", "edit", "create", "publish"]);
+
+    // Pulls command lines out of a reply, leaving the prose. Lines inside a
+    // fenced code block are left alone: a model showing you what /memory looks
+    // like in an example must not thereby run it.
+    function extractCommands(text) {
+        const commands = [];
+        const kept = [];
+        let inFence = false;
+        for (const line of text.split("\n")) {
+            if (/^\s*```/.test(line)) { inFence = !inFence; kept.push(line); continue; }
+            const m = inFence ? null : /^\s*\/(\w+)(?:[ \t]+([\s\S]*))?$/.exec(line);
+            if (m && KNOWN_COMMANDS.has(m[1].toLowerCase())) {
+                commands.push(line.trim());
+                continue;
+            }
+            kept.push(line);
+        }
+        return { text: kept.join("\n"), commands: commands };
+    }
 
     // Returns the text to show, or null when this isn't a command at all (so a
     // message that merely starts with a slash, like a path, still goes to the
@@ -833,13 +900,16 @@
         els.sendBtn.setAttribute("aria-label", sending ? "Stop generating" : "Send message");
     }
 
-    async function persistAiReply(chatId, text) {
+    async function persistAiReply(chatId, text, notes) {
         // Re-read instead of reusing the copy captured before the request:
         // the stored chat may have moved on while the model was generating.
         const fresh = (await idbGet("chats", chatId)) || null;
         if (!fresh) return;
         if (!Array.isArray(fresh.messages)) fresh.messages = [];
-        fresh.messages.push({ sender: "ai", text });
+        // The command lines are already stripped: storing the raw reply would
+        // re-feed Galla its own commands as context.
+        if (text) fresh.messages.push({ sender: "ai", text: text });
+        (notes || []).forEach((n) => fresh.messages.push({ sender: "note", text: n }));
         fresh.timestamp = Date.now();
         await idbPut("chats", fresh);
     }
@@ -868,8 +938,9 @@
                 return;
             }
 
-            // Commands are handled locally and never reach Ollama, so they work
-            // whether or not it is running.
+            // Typed commands run immediately: you asking for something is not a
+            // request that needs confirming. They never reach Ollama, so they
+            // work whether or not it is running.
             if (text.startsWith("/")) {
                 const result = await runCommand(text);
                 if (result !== null) {
@@ -955,11 +1026,41 @@
                 }
             });
 
+            // Commands Galla emitted on their own line are lifted out of the
+            // reply so the prose reads cleanly. Reads run straight away; writes
+            // are only ever proposed, because the model acts on whatever is in
+            // the conversation, including text you pasted in from elsewhere.
+            const parsed = extractCommands(full);
+            const notes = [];
+            const proposals = [];
+            for (const line of parsed.commands) {
+                if (/^\/memory\b/i.test(line)) { proposals.push(line); continue; }
+                const result = await runCommand(line);
+                if (result !== null) notes.push(result);
+            }
+
+            const prose = parsed.text.trim();
+            const hadCommands = notes.length > 0 || proposals.length > 0;
+            const display = prose || (hadCommands ? "" : "_(The model returned an empty response.)_");
+
             if (onScreen()) {
-                fillBubble(bubble, "ai", full.trim() || "_(The model returned an empty response.)_");
+                if (display) {
+                    fillBubble(bubble, "ai", display);
+                } else {
+                    bubble.remove();   // the reply was nothing but commands
+                }
+                notes.forEach(renderNote);
+                proposals.forEach((line) => {
+                    const what = line.replace(/^\/memory\s*/i, "").trim();
+                    renderConfirm("Galla wants to remember: “" + what + "”", async () => {
+                        const result = await runCommand(line);
+                        await persistAiReply(chatId, "", [result]);
+                        return result;
+                    });
+                });
                 scrollToBottom();
             }
-            if (full.trim()) await persistAiReply(chatId, full);
+            if (display || notes.length) await persistAiReply(chatId, display, notes);
         } catch (err) {
             if (err.name === "AbortError") {
                 if (full.trim()) {

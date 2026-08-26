@@ -324,6 +324,31 @@ textarea.field { resize: vertical; }
     overflow-wrap: anywhere;
 }
 
+.confirm-note {
+    border-style: solid;
+    border-color: var(--accent);
+    background: rgba(59, 130, 246, 0.1);
+    color: var(--text-main);
+}
+.confirm-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+    flex-wrap: wrap;
+}
+.confirm-btn {
+    background-color: var(--accent);
+    color: white;
+    border: none;
+    padding: 0.4rem 0.8rem;
+    border-radius: 0.35rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+.confirm-btn.secondary { background-color: #475569; }
+.confirm-btn:hover { filter: brightness(1.1); }
+
 .tried-list {
     margin: 0;
     padding-left: 1.25rem;
