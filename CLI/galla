@@ -372,67 +372,142 @@ cmd_publish() {
 CHAT_ENDPOINTS="${GALLA_OLLAMA:-http://localhost:11434 https://ollama-tunnel.serveousercontent.com}"
 DEFAULT_MODEL="treyleo16/gpt-5-6-sol"
 
+# The models Galla runs on, and the only ones it will run on — the same five
+# the chat app offers, so a project behaves the same whichever end you drive
+# it from. Fields: id | name | other ways to say it.
+GALLA_MODELS="\
+treyleo16/gpt-5-6-sol|GPT 5.6 Sol|sol
+rhododendron/galla:sonnet-1|GallaSonnet 1 Pro|sonnet-1 sonnet
+rhododendron/galla:opus-1|GallaOpus 1|opus-1 opus
+rhododendron/galla:1|Galla 1|1
+rhododendron/galla:1-pro|Galla 1 Pro|1-pro"
+
+# Ignore the capitals and punctuation people reasonably differ on, so
+# "GallaOpus 1", "galla:opus-1" and "opus" are all one name.
+model_key() {
+    printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d ' .:/_-'
+}
+
+# A name -> the id to send to Ollama. Nothing outside the roster resolves,
+# which is what keeps the roster meaningful.
+model_id() {
+    local want; want="$(model_key "$1")"
+    if [ -z "$want" ]; then return 1; fi
+    local id name aliases a
+    while IFS='|' read -r id name aliases; do
+        if [ -z "$id" ]; then continue; fi
+        if [ "$want" = "$(model_key "$id")" ] || [ "$want" = "$(model_key "$name")" ]; then
+            printf '%s' "$id"; return 0
+        fi
+        for a in $aliases; do
+            if [ "$want" = "$(model_key "$a")" ]; then printf '%s' "$id"; return 0; fi
+        done
+    done <<<"$GALLA_MODELS"
+    return 1
+}
+
 # Which model to talk to, most specific first: this one command, then the one
-# you chose with `galla model`, then the default.
+# you chose with `galla model`, then the default. A name off the roster stops
+# here rather than reaching Ollama.
 chat_model() {
-    if [ -n "${GALLA_MODEL:-}" ]; then printf '%s' "$GALLA_MODEL"; return; fi
-    load_config
-    printf '%s' "${GALLA_SAVED_MODEL:-$DEFAULT_MODEL}"
+    local want source fix
+    if [ -n "${GALLA_MODEL:-}" ]; then
+        want="$GALLA_MODEL"
+        source="GALLA_MODEL in this shell"
+        fix="galla models   lists the ones there are."
+    else
+        load_config
+        want="${GALLA_SAVED_MODEL:-$DEFAULT_MODEL}"
+        source="galla model"
+        # An older galla saved any name at all, so a config can arrive here
+        # holding one. Name the one command that clears it.
+        fix="galla model default   puts it back to $DEFAULT_MODEL."
+    fi
+    local id
+    if id="$(model_id "$want")"; then
+        printf '%s' "$id"; return 0
+    fi
+    warn "galla: '$want' is not a Galla model (set by $source)."
+    warn "       $fix"
+    return 1
+}
+
+# What Ollama has pulled, one name per line, :latest trimmed.
+pulled_models() {
+    curl -fsS --max-time 8 "$1/api/tags" 2>/dev/null |
+        grep -o '"name":"[^"]*"' | sed 's/.*:"//; s/"$//; s/:latest$//'
 }
 
 cmd_models() {
-    local base; base="$(chat_endpoint)" ||
-        fail "can't reach Ollama. Start it with:  OLLAMA_ORIGINS=\"*\" ollama serve"
-    local current; current="$(chat_model)"
-    local names
-    names="$(curl -fsS --max-time 8 "$base/api/tags" 2>/dev/null | grep -o '"name":"[^"]*"' | sed 's/.*:"//; s/"$//')"
-    if [ -z "$names" ]; then
-        say "Ollama answered but has no models pulled yet."
-        say "  ollama pull $DEFAULT_MODEL"
-        return
+    local base pulled="" reachable=""
+    if base="$(chat_endpoint)"; then
+        reachable=yes
+        pulled="$(pulled_models "$base")"
     fi
-    say "Models on this machine:"
-    local n
-    while IFS= read -r n; do
-        if [ "$n" = "$current" ] || [ "${n%:latest}" = "${current%:latest}" ]; then
-            printf '  * %s   (in use)\n' "$n"
-        else
-            printf '    %s\n' "$n"
-        fi
-    done <<<"$names"
+
+    local current=""
+    current="$(chat_model)" || current=""
+
+    say "Galla models:"
     say ""
-    say "Switch with:  galla model <name>"
+    local id name aliases mark status
+    while IFS='|' read -r id name aliases; do
+        if [ -z "$id" ]; then continue; fi
+        if [ "$id" = "$current" ]; then mark="*"; else mark=" "; fi
+        status=""
+        if [ -n "$reachable" ] && ! printf '%s\n' "$pulled" | grep -Fqx "$id"; then
+            status="not pulled"
+        fi
+        if [ "$id" = "$current" ]; then
+            if [ -n "$status" ]; then status="in use, $status"; else status="in use"; fi
+        fi
+        printf ' %s %-30s %-18s %s\n' "$mark" "$id" "$name" "$status"
+    done <<<"$GALLA_MODELS"
+
+    say ""
+    if [ -z "$reachable" ]; then
+        say "(Ollama isn't running, so I can't say which of these are pulled.)"
+    fi
+    say "Switch with:  galla model opus-1"
 }
 
 cmd_model() {
     local wanted="${1:-}"
     if [ -z "$wanted" ]; then
-        say "$(chat_model)"
+        local current
+        current="$(chat_model)" || return 1
+        say "$current"
         if [ -n "${GALLA_MODEL:-}" ]; then
             say "(from GALLA_MODEL in this shell, which wins over the saved one)"
         fi
-        return
+        return 0
     fi
 
     if [ "$wanted" = "default" ] || [ "$wanted" = "reset" ]; then
         load_config; GALLA_SAVED_MODEL=""; save_config
         say "Back to the default: $DEFAULT_MODEL"
-        return
+        return 0
     fi
 
-    # Warn rather than refuse: Ollama may simply not be running right now, and
-    # being unable to check is not the same as the model being wrong.
+    local id
+    if ! id="$(model_id "$wanted")"; then
+        warn "galla: there is no Galla model called '$wanted'."
+        warn "       galla models   lists the ones there are."
+        return 1
+    fi
+
+    # Not pulled is worth saying, not worth refusing over: Ollama may simply
+    # not be running, and being unable to check is not evidence of anything.
     local base
     if base="$(chat_endpoint)"; then
-        if ! curl -fsS --max-time 8 "$base/api/tags" 2>/dev/null |
-             grep -q "\"name\":\"${wanted%:latest}\(:latest\)\?\""; then
-            warn "note: $wanted isn't pulled on this machine yet."
-            warn "      ollama pull $wanted"
+        if ! pulled_models "$base" | grep -Fqx "$id"; then
+            warn "note: $id isn't pulled on this machine yet."
+            warn "      ollama pull $id"
         fi
     fi
 
-    load_config; GALLA_SAVED_MODEL="$wanted"; save_config
-    say "Galla will use $wanted."
+    load_config; GALLA_SAVED_MODEL="$id"; save_config
+    say "Galla will use $id."
 }
 
 # Text -> the inside of a JSON string.
@@ -602,7 +677,8 @@ cmd_chat() {
     base="$(chat_endpoint)" ||
         fail "can't reach Ollama. Start it with:  OLLAMA_ORIGINS=\"*\" ollama serve"
 
-    local model; model="$(chat_model)"
+    local model
+    model="$(chat_model)" || exit 1
     say "Galla is in $name   ($model)"
     say "Ask for what you want built. /files lists them, /publish ships it, /exit leaves."
     say ""
@@ -756,7 +832,7 @@ galla $VERSION - make things and put them on the web.
   galla publish <name> [message]  commit, push, and put it on GitHub Pages
 
   galla chat [name]             talk to Galla; it writes files in the project
-  galla models                  list the models on this machine
+  galla models                  the models Galla can use
   galla model [name]            show or change the model Galla uses
   galla connect                 let the chat app work with these projects
   galla token                   show the pairing token again
