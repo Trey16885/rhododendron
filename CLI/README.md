@@ -157,6 +157,43 @@ as the name being wrong, so it doesn't refuse.
 Memories from the chat app do not carry over: those live in the browser. This
 is a workspace, not the same conversation.
 
+### When the repo has moved on without you
+
+If you edit a file on github.com and then publish, git refuses the push: the
+repo has a commit your copy doesn't. Galla works out which kind of
+disagreement that is.
+
+**Different files changed?** It combines them and publishes. Git only merges
+cleanly when the two sides touched different things, so nothing is being
+guessed at — both edits end up on the site.
+
+```
+Trey16885/my-site has work your copy doesn't - something else pushed to it,
+most likely an edit made on github.com.
+
+Fetching it to compare ...
+They didn't overlap, so both are in. Pushed.
+```
+
+**Same lines changed?** Then picking one is a decision, and it's yours. Your
+version goes on a branch and becomes a pull request. `main` is not touched and
+neither version is lost — you compare them on github.com and merge if it looks
+right.
+
+```
+The same lines changed on both sides, so combining them is a choice,
+not a merge - and it is yours to make, not mine.
+
+Pushed branch galla-20260826-204157
+
+Opened a pull request:
+  https://github.com/Trey16885/my-site/pull/7
+```
+
+Opening it needs **Pull requests: Read and write** on the token. Without that
+the branch is still pushed safely, and Galla prints the compare URL to open it
+by hand.
+
 ### The token
 
 `galla auth` asks for a GitHub **fine-grained** personal access token — make one
@@ -172,6 +209,7 @@ can't create a new repo, and wouldn't cover a repo you make tomorrow.
 | Contents | Read and write | push your files |
 | Administration | Read and write | create the repository |
 | Pages | Read and write | switch the site on |
+| Pull requests | Read and write | open a PR when the repo has moved on without you |
 | Metadata | Read-only | ticked for you already |
 
 Add Workflows if you want Actions later.

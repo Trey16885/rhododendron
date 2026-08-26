@@ -156,6 +156,7 @@ auth_instructions() {
     say "    Contents          Read and write    push your files"
     say "    Administration    Read and write    create the repository"
     say "    Pages             Read and write    switch the site on"
+    say "    Pull requests     Read and write    when the site has moved on without you"
     say "    Metadata          Read-only         ticked for you already"
     say ""
     say "    Workflows too, if you want Actions later."
@@ -355,6 +356,87 @@ pages_url() {
     printf 'https://%s.github.io/%s/' "$owner" "$name"
 }
 
+# The remote has commits we don't. Rather than stopping, work out whether
+# that is a real disagreement or just two people touching different files.
+#
+# A merge that succeeds on its own is not a guess: git only manages it when
+# the two sides changed different things. When they changed the same lines,
+# choosing between them is a decision, and this is not the place to make it --
+# so that version goes on a branch and becomes a pull request, where both
+# copies survive and you decide on github.com.
+publish_diverged() {
+    local dir="$1" repo="$2" push_url="$3" name="$4"
+    local gitc=(git -C "$dir" -c "user.name=${GALLA_USER:-Galla}"
+                -c "user.email=${GALLA_USER:-galla}@users.noreply.github.com")
+
+    say ""
+    say "$repo has work your copy doesn't - something else pushed to it,"
+    say "most likely an edit made on github.com."
+    say ""
+    say "Fetching it to compare ..."
+    if ! git -C "$dir" fetch -q "$push_url" main 2>/dev/null; then
+        fail "could not fetch $repo to compare against. Check your connection."
+    fi
+
+    if "${gitc[@]}" merge --no-edit -q FETCH_HEAD >/dev/null 2>&1; then
+        local err
+        if err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+            say "They didn't overlap, so both are in. Pushed."
+            return 0
+        fi
+        warn "galla: combined them, but the push still failed:"
+        printf '%s\n' "$err" | redact | sed 's/^/  /' >&2
+        exit 1
+    fi
+
+    "${gitc[@]}" merge --abort >/dev/null 2>&1 || true
+
+    local branch="galla-$(date +%Y%m%d-%H%M%S)"
+    say ""
+    say "The same lines changed on both sides, so combining them is a choice,"
+    say "not a merge - and it is yours to make, not mine."
+    say ""
+    say "Putting your version on a branch instead. Nothing already on $repo"
+    say "is changed or lost."
+    say ""
+    local err
+    if ! err="$(git -C "$dir" push -q "$push_url" "main:refs/heads/$branch" 2>&1)"; then
+        warn "galla: could not push the branch:"
+        printf '%s\n' "$err" | redact | sed 's/^/  /' >&2
+        exit 1
+    fi
+    say "Pushed branch $branch"
+
+    local body pr_url
+    body="$(api_ok POST "/repos/$repo/pulls" \
+        "{\"title\":\"Changes from Galla ($branch)\",\"head\":\"$branch\",\"base\":\"main\",\"body\":\"Published from the Galla CLI. The same lines changed here and on main, so this is a pull request rather than a direct push - open the Files changed tab to see both versions.\"}" 2>/dev/null)" \
+        && pr_url="$(json_field "$body" html_url)" || pr_url=""
+
+    say ""
+    if [ -n "$pr_url" ]; then
+        say "Opened a pull request:"
+        say "  $pr_url"
+        say ""
+        say "Open it, look at 'Files changed', and merge it if it looks right."
+    else
+        # Creating one needs Pull requests: Read and write. Without it the
+        # branch is still safely pushed, and GitHub will open the same
+        # comparison from a URL.
+        say "Couldn't open the pull request itself"
+        [ -n "$body" ] && say "  ($(json_field "$body" message))"
+        say ""
+        say "The branch is pushed, so open it here instead:"
+        say "  https://github.com/$repo/compare/main...$branch"
+        say ""
+        say "(Adding 'Pull requests: Read and write' to the token lets galla"
+        say " open it for you next time.)"
+    fi
+
+    say ""
+    say "Until that is merged, 'galla publish $name' will land here again -"
+    say "your copy still differs from main."
+}
+
 cmd_publish() {
     require_auth
     local name="${1:-}"; shift || true
@@ -393,12 +475,28 @@ cmd_publish() {
 
     local push_err
     if ! push_err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+        case "$push_err" in
+            # The remote moved on without us -- almost always an edit made on
+            # github.com. Nothing is wrong and nothing needs fixing by hand;
+            # the two versions just need reconciling.
+            *"fetch first"*|*non-fast-forward*|*"Updates were rejected"*)
+                publish_diverged "$dir" "$repo" "$push_url" "$name"
+                return
+                ;;
+        esac
         warn "galla: push to $repo failed. git said:"
         warn ""
         printf '%s\n' "$push_err" | redact | sed 's/^/  /' >&2
-        warn ""
-        warn "If that is about permission, the token needs Contents: Read and write"
-        warn "on $repo, and must not have expired. 'galla doctor $name' checks."
+        # Only offer the permission reading when it could be one. Saying it
+        # after an error that is plainly about something else is noise that
+        # sends you to check a token that was never the problem.
+        case "$push_err" in
+            *[Aa]uthentication*|*[Pp]ermission*|*403*|*[Dd]enied*|*[Uu]nauthorized*)
+                warn ""
+                warn "The token needs Contents: Read and write on $repo, and must not"
+                warn "have expired. 'galla doctor $name' checks."
+                ;;
+        esac
         exit 1
     fi
     say "Pushed."
@@ -535,6 +633,13 @@ cmd_doctor() {
         404*) say "  Pages     read ok, Pages not switched on yet" ;;
         403*) say "  Pages     REFUSED - ${probe#403 }" ;;
         *)    say "  Pages     $probe" ;;
+    esac
+
+    probe="$(api_probe GET "/repos/$repo/pulls?per_page=1")"
+    case "$probe" in
+        200*) say "  Pull req. read ok" ;;
+        403*) say "  Pull req. REFUSED - ${probe#403 }" ;;
+        *)    say "  Pull req. $probe" ;;
     esac
 
     # Contents cannot be probed without writing, so ask git the same question
