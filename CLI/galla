@@ -60,6 +60,13 @@ api() {
 
 # git prints the URL it failed on, and for a push that URL carries the token.
 # Anything from git therefore goes through here before it is shown.
+# [ -r /dev/tty ] only asks whether the path exists and is readable, which it
+# is even for a process with no controlling terminal -- under setsid or a
+# service the open then fails. Opening it is the only honest test. stderr is
+# redirected before the open, because bash reports a failed redirect through
+# the shell's stderr, not the command's.
+tty_readable() { { : < /dev/tty; } 2>/dev/null; }
+
 redact() {
     if [ -n "${GALLA_PAT:-}" ]; then
         sed "s|$GALLA_PAT|***|g"
@@ -391,13 +398,61 @@ publish_diverged() {
 
     "${gitc[@]}" merge --abort >/dev/null 2>&1 || true
 
+    # The same lines changed on both sides. Someone has to choose, but that
+    # someone is standing right here -- so ask, and skip the pull request
+    # entirely. A branch you have to go and merge is only worth it when there
+    # is nobody to ask.
+    #
+    # Either answer merges rather than force-pushes: the version not chosen
+    # stays in the history, so nothing is destroyed by picking wrong.
+    local ans=""
+    if tty_readable; then
+        say ""
+        say "The same lines changed in both your copy and $repo."
+        say ""
+        say "  1) keep mine      - what is in $name now wins"
+        say "  2) keep theirs    - what is on GitHub wins"
+        say "  3) neither yet    - open a pull request and decide there"
+        say ""
+        printf 'Which? [1/2/3] '
+        read -r ans 2>/dev/null < /dev/tty || ans=""
+    fi
+
+    local strategy=""
+    case "$ans" in
+        1) strategy=ours ;;
+        2) strategy=theirs ;;
+    esac
+
+    if [ -n "$strategy" ]; then
+        if ! "${gitc[@]}" merge --no-edit -q -X "$strategy" FETCH_HEAD >/dev/null 2>&1; then
+            "${gitc[@]}" merge --abort >/dev/null 2>&1 || true
+            warn "galla: could not combine them that way. Falling back to a branch."
+        else
+            local err
+            if err="$(git -C "$dir" push -q "$push_url" main 2>&1)"; then
+                if [ "$strategy" = ours ]; then
+                    say "Kept yours. Pushed."
+                else
+                    say "Kept the GitHub version. Pushed."
+                    say "(Your files in $name now match it.)"
+                fi
+                say ""
+                say "Nothing was thrown away - the other version is still in the"
+                say "repository's history."
+                return 0
+            fi
+            warn "galla: combined them, but the push failed:"
+            printf '%s\n' "$err" | redact | sed 's/^/  /' >&2
+            exit 1
+        fi
+    fi
+
     local branch="galla-$(date +%Y%m%d-%H%M%S)"
     say ""
-    say "The same lines changed on both sides, so combining them is a choice,"
-    say "not a merge - and it is yours to make, not mine."
+    say "Putting your version on a branch to decide on later."
     say ""
-    say "Putting your version on a branch instead. Nothing already on $repo"
-    say "is changed or lost."
+    say "Nothing already on $repo is changed or lost."
     say ""
     local err
     if ! err="$(git -C "$dir" push -q "$push_url" "main:refs/heads/$branch" 2>&1)"; then
@@ -941,9 +996,9 @@ write_files() {
             # terminal, since the chat loop is already reading stdin -- and with
             # no terminal at all the answer is no.
             ans=""
-            if [ -r /dev/tty ]; then
+            if tty_readable; then
                 printf '  overwrite %s? [y/N] ' "$path"
-                read -r ans < /dev/tty 2>/dev/null || ans=""
+                read -r ans 2>/dev/null < /dev/tty || ans=""
             fi
             case "$ans" in
                 [yY]*) ;;

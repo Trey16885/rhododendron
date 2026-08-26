@@ -175,24 +175,31 @@ Fetching it to compare ...
 They didn't overlap, so both are in. Pushed.
 ```
 
-**Same lines changed?** Then picking one is a decision, and it's yours. Your
-version goes on a branch and becomes a pull request. `main` is not touched and
-neither version is lost — you compare them on github.com and merge if it looks
-right.
+**Same lines changed?** Someone has to choose — and you're standing right
+there, so it asks instead of making you go and merge something:
 
 ```
-The same lines changed on both sides, so combining them is a choice,
-not a merge - and it is yours to make, not mine.
+The same lines changed in both your copy and Trey16885/my-site.
 
-Pushed branch galla-20260826-204157
+  1) keep mine      - what is in my-site now wins
+  2) keep theirs    - what is on GitHub wins
+  3) neither yet    - open a pull request and decide there
 
-Opened a pull request:
-  https://github.com/Trey16885/my-site/pull/7
+Which? [1/2/3]
 ```
 
-Opening it needs **Pull requests: Read and write** on the token. Without that
-the branch is still pushed safely, and Galla prints the compare URL to open it
-by hand.
+Answer 1 or 2 and it publishes straight away — **no pull request to go and
+merge.** Either answer *merges*, it never force-pushes, so the version you
+didn't pick is still in the repository's history and nothing is destroyed by
+choosing wrong.
+
+Answer 3 when you'd rather look at both side by side: your version goes on a
+`galla-<timestamp>` branch and becomes a pull request, leaving `main` alone.
+That's also what happens with no terminal to ask on — a script never gets a
+side picked for it silently.
+
+Opening the PR needs **Pull requests: Read and write** on the token. Without
+that the branch is still pushed safely, and Galla prints the compare URL.
 
 ### The token
 
