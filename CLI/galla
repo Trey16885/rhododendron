@@ -388,7 +388,27 @@ publish_diverged() {
         fail "could not fetch $repo to compare against. Check your connection."
     fi
 
-    if "${gitc[@]}" merge --no-edit -q FETCH_HEAD >/dev/null 2>&1; then
+    # git refuses outright when the two sides share no ancestor -- a project
+    # started here and then linked to a repo that already had content. That is
+    # not a conflict and there is nothing to choose between; it just needs
+    # saying out loud. Without this the refusal was read as a conflict, and
+    # the branch that came out of it had no commits in common with main, which
+    # is what GitHub then rejected the pull request for.
+    local unrelated=() merge_err merge_ok=""
+    if merge_err="$("${gitc[@]}" merge --no-edit -q FETCH_HEAD 2>&1)"; then
+        merge_ok=1
+    elif case "$merge_err" in *"unrelated histories"*) true ;; *) false ;; esac; then
+        say "These two were started separately, so they have no history in"
+        say "common. Joining them anyway."
+        say ""
+        unrelated=(--allow-unrelated-histories)
+        "${gitc[@]}" merge --abort >/dev/null 2>&1 || true
+        if "${gitc[@]}" merge --no-edit -q "${unrelated[@]}" FETCH_HEAD >/dev/null 2>&1; then
+            merge_ok=1
+        fi
+    fi
+
+    if [ -n "$merge_ok" ]; then
         local err
         if err="$(git -C "$dir" push -q "$push_url" "$base" 2>&1)"; then
             say "They didn't overlap, so both are in. Pushed."
@@ -428,7 +448,7 @@ publish_diverged() {
     esac
 
     if [ -n "$strategy" ]; then
-        if ! "${gitc[@]}" merge --no-edit -q -X "$strategy" FETCH_HEAD >/dev/null 2>&1; then
+        if ! "${gitc[@]}" merge --no-edit -q "${unrelated[@]}" -X "$strategy" FETCH_HEAD >/dev/null 2>&1; then
             "${gitc[@]}" merge --abort >/dev/null 2>&1 || true
             warn "galla: could not combine them that way. Falling back to a branch."
         else
@@ -509,8 +529,10 @@ publish_diverged() {
             # token, and saying so would send you to check the wrong thing.
             say "Couldn't open the pull request:"
             say "  ${code:-no response} $(json_field "$body" message)"
-            local detail; detail="$(json_field "$body" errors)"
-            [ -n "$detail" ] && say "  $detail"
+            # The sentence that actually explains it lives in errors[].message
+            # -- an array of objects, which json_field cannot read, so asking
+            # it for "errors" returned nothing and left this line blank.
+            json_all "$body" message | tail -n +2 | sed 's/^/  /'
             say ""
             say "The branch is pushed, so nothing is lost. Open it here:"
             say "  https://github.com/$repo/compare/$base...$branch"

@@ -175,6 +175,11 @@ Fetching it to compare ...
 They didn't overlap, so both are in. Pushed.
 ```
 
+**No history in common?** That happens when you start a project here and then
+link it to a repo that already had files in it. Git refuses such a merge unless
+told otherwise, so Galla tells it — the two are joined and you carry on. It is
+not a conflict and there is nothing to decide.
+
 **Same lines changed?** Someone has to choose — and you're standing right
 there, so it asks instead of making you go and merge something:
 
